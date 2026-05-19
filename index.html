@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#faf9f7" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#1a1815" media="(prefers-color-scheme: dark)" />
+  <title>Gastos — Control mensual</title>
+
+  <!-- PWA -->
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icons/icon-192.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icons/icon-192.svg" />
+
+  <!-- Tema: aplicar antes de renderizar para evitar flash -->
+  <script>document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'dark');</script>
+
+  <!-- Estilos -->
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+
+  <!-- ===== Sidebar ===== -->
+  <div class="sidebar-overlay" id="sidebar-overlay"></div>
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <span class="sidebar-title">Menú</span>
+      <button class="sidebar-close" id="btn-sidebar-close" aria-label="Cerrar menú"></button>
+    </div>
+    <div class="sidebar-body" id="sidebar-body"></div>
+  </aside>
+
+  <!-- ===== Modal (novedades / cambios / quick-add) ===== -->
+  <div class="modal-overlay" id="modal-overlay"></div>
+  <div class="modal" id="modal" role="dialog" aria-modal="true">
+    <div class="modal-header">
+      <span class="modal-title" id="modal-title">Novedades</span>
+      <button class="modal-close" id="btn-modal-close" aria-label="Cerrar"></button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+
+  <!-- ===== Header ===== -->
+  <header class="app-header">
+    <div class="header-inner">
+      <button id="btn-menu" class="btn-menu" aria-label="Abrir menú"></button>
+
+      <div class="app-logo">
+        Gastos
+        <small>Control mensual</small>
+      </div>
+
+      <nav class="month-nav">
+        <button id="btn-prev" class="btn-nav" aria-label="Mes anterior">‹</button>
+        <button id="btn-month-picker" class="month-nav-text" aria-label="Elegir mes">
+          <span id="month-label">Mayo</span>
+          <span id="year-label">2026</span>
+        </button>
+        <button id="btn-next" class="btn-nav" aria-label="Mes siguiente">›</button>
+      </nav>
+
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="dashboard">Gastos</button>
+        <button class="tab-btn" data-tab="savings">Ahorro</button>
+        <button class="tab-btn" data-tab="calendar">Calendario</button>
+        <button class="tab-btn" data-tab="reports">Informes</button>
+      </div>
+
+      <button id="btn-theme" class="btn-theme" aria-label="Cambiar tema" title="Cambiar tema"></button>
+    </div>
+  </header>
+
+  <!-- ===== Contenido principal ===== -->
+  <main class="main-wrap" id="main-content">
+    <!-- Renderizado dinámico por app.js -->
+  </main>
+
+  <!-- ===== Botón flotante Quick-add (solo móvil) ===== -->
+  <button id="btn-quick-add" class="fab-quick-add" aria-label="Añadir gasto rápido" title="Añadir gasto"></button>
+
+  <!-- ===== Scripts ===== -->
+  <!-- Chart.js desde CDN (se cachea con service worker tras la primera carga) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+
+  <!-- Módulos de la app (orden importa: db → utils → icons → chart → app) -->
+  <script src="js/db.js"></script>
+  <script src="js/utils.js"></script>
+  <script src="js/icons.js"></script>
+  <script src="js/chart.js"></script>
+  <script src="js/app.js"></script>
+
+  <!-- Service Worker para PWA -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js').catch(() => {
+          /* Sin SW (file://, navegador antiguo o privacy mode): la app sigue funcionando */
+        });
+      });
+    }
+  </script>
+
+</body>
+</html>
