@@ -2101,7 +2101,7 @@ function openCategoryEdit(cat, row) {
 
   // Picker con el icono actual preseleccionado (resuelve emoji legacy → id)
   const picker = buildIconPicker(Icons.resolve(cat.icon));
-  picker.classList.add('icon-picker-compact');
+  picker.classList.add('icon-picker--cat-edit');
   row.appendChild(picker);
 
   [nameInp, limitInp].forEach(inp => {

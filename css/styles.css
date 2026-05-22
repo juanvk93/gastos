@@ -632,13 +632,19 @@ select.form-input {
   flex-wrap: wrap;
 }
 
-.icon-picker-compact {
+/* Picker específico para edición inline de categoría — compacto y autocontenido */
+.icon-picker--cat-edit {
+  grid-template-columns: repeat(auto-fill, 36px);
+  grid-auto-rows: 36px;
+  gap: 4px;
   padding: 6px;
   background: transparent;
   border: 1px dashed var(--ink-200);
+  height: fit-content;
+  width: 100%;
 }
-.icon-picker-compact .icon-pick-item {
-  padding: 6px;
+.icon-picker--cat-edit .icon-pick-item {
+  padding: 4px;
 }
 
 /* ---- Límites mensuales ---- */
@@ -826,12 +832,16 @@ select.form-input {
 
 .icon-picker {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(44px, 1fr));
+  grid-template-columns: repeat(auto-fill, 44px);
+  grid-auto-rows: 44px;
   gap: 6px;
   padding: 10px;
   background: var(--ink-50);
   border-radius: var(--radius-sm);
   border: 1px solid var(--ink-200);
+  align-content: start;
+  justify-content: space-between;
+  height: max-content;
 }
 
 .icon-pick-item {
@@ -845,7 +855,6 @@ select.form-input {
   align-items: center;
   justify-content: center;
   transition: all 0.12s;
-  aspect-ratio: 1 / 1;
 }
 .icon-pick-item:hover {
   background: var(--ink-100);
@@ -2142,11 +2151,21 @@ button.month-nav-text:hover { background: var(--ink-100); }
 
   /* Icon picker */
   .icon-picker {
-    grid-template-columns: repeat(auto-fill, minmax(40px, 1fr));
+    grid-template-columns: repeat(auto-fill, 38px);
+    grid-auto-rows: 38px;
     gap: 4px;
     padding: 8px;
   }
   .icon-pick-item { padding: 6px; }
+
+  /* Override mobile para picker de edición inline (más compacto) */
+  .icon-picker--cat-edit {
+    grid-template-columns: repeat(auto-fill, 32px);
+    grid-auto-rows: 32px;
+    gap: 3px;
+    padding: 5px;
+  }
+  .icon-picker--cat-edit .icon-pick-item { padding: 3px; }
 
   /* Modal a pantalla casi completa en móvil */
   .modal {
