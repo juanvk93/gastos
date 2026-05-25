@@ -322,6 +322,51 @@ h1, h2, h3 { font-family: var(--font-display); letter-spacing: -0.02em; }
   font-size: 1.05rem;
 }
 
+/* Línea secundaria con el esperado fin de mes (proyectado, no real). */
+.summary-expected {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 8px;
+  padding: 8px 14px;
+  font-size: 0.85rem;
+  color: var(--ink-500);
+  border: 1px dashed var(--ink-200);
+  border-radius: var(--radius-sm);
+}
+
+/* Línea proyectada en Ahorro: "Si se materializa lo pendiente: X €" */
+.savings-projection-hint {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 8px 12px;
+  font-size: 0.82rem;
+  color: var(--ink-500);
+  border: 1px dashed var(--ink-200);
+  border-radius: var(--radius-sm);
+}
+
+/* Mini-card de pendientes del mes contable */
+.pending-card { padding: 18px 24px; }
+.pending-list { display: flex; flex-direction: column; gap: 4px; }
+.pending-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 4px;
+  border-radius: var(--radius-sm);
+  opacity: 0.85;
+}
+.pending-row:hover { opacity: 1; background: var(--ink-50); }
+[data-theme="dark"] .pending-row:hover { background: rgba(255,255,255,0.03); }
+.pending-row .expense-amount {
+  color: var(--ink-500);
+  font-style: italic;
+}
+
 /* ---- Forms ---- */
 
 .expense-form, .recurring-form {
@@ -402,6 +447,203 @@ select.form-input {
   accent-color: var(--accent);
 }
 .check-label small { color: var(--ink-500); }
+
+/* ---- Frequency radios (Mensual / Anual / Anualizado) ---- */
+
+.freq-radios {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.freq-radio {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--ink-200);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  background: var(--ink-50);
+  transition: background 0.12s, border-color 0.12s;
+}
+.freq-radio:hover { background: var(--ink-100); }
+.freq-radio:has(input:checked) {
+  background: var(--ink-100);
+  border-color: var(--accent);
+}
+[data-theme="dark"] .freq-radio { background: var(--ink-100); }
+[data-theme="dark"] .freq-radio:hover { background: var(--ink-200); }
+[data-theme="dark"] .freq-radio:has(input:checked) {
+  background: var(--ink-200);
+  border-color: var(--accent-light);
+}
+
+.freq-radio input[type="radio"] {
+  margin-top: 2px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+
+.freq-radio-text { display: flex; flex-direction: column; gap: 2px; line-height: 1.35; }
+.freq-radio-label { font-size: 0.92rem; font-weight: 600; color: var(--ink-900); }
+.freq-radio-hint  { font-size: 0.78rem; color: var(--ink-500); }
+
+/* ---- Day picker (selector día del mes 1-31) ---- */
+
+.day-picker { position: relative; }
+
+.day-picker-trigger {
+  text-align: left;
+  cursor: pointer;
+  color: var(--ink-500);
+  font-family: var(--font-body);
+}
+.day-picker-trigger.has-value { color: var(--ink-900); }
+.day-picker-trigger:hover { border-color: var(--ink-300); }
+.day-picker-trigger:focus { outline: none; border-color: var(--accent); }
+
+.day-picker-popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 50;
+  background: var(--ink-50);
+  border: 1px solid var(--ink-200);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  padding: 12px;
+}
+[data-theme="dark"] .day-picker-popover {
+  background: var(--ink-100);
+  border-color: var(--ink-300);
+}
+.day-picker-popover.hidden { display: none; }
+
+.day-picker-section + .day-picker-section { margin-top: 12px; }
+.day-picker-section.hidden { display: none; }
+.day-picker-section-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-500);
+  margin-bottom: 6px;
+}
+
+.day-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 4px;
+}
+
+.month-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+}
+
+.month-picker-cell {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 8px 0;
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  color: var(--ink-700);
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  min-height: 36px;
+}
+.month-picker-cell:hover {
+  background: var(--ink-100);
+  color: var(--ink-900);
+}
+[data-theme="dark"] .month-picker-cell:hover { background: var(--ink-200); }
+.month-picker-cell.selected {
+  background: var(--accent);
+  color: var(--ink-50);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+[data-theme="dark"] .month-picker-cell.selected {
+  background: var(--accent-light);
+  border-color: var(--accent-light);
+  color: #1a1815;
+}
+
+.day-picker-cell {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 8px 0;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.88rem;
+  color: var(--ink-700);
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  min-height: 36px;
+}
+.day-picker-cell:hover {
+  background: var(--ink-100);
+  color: var(--ink-900);
+}
+[data-theme="dark"] .day-picker-cell:hover { background: var(--ink-200); }
+.day-picker-cell.selected {
+  background: var(--accent);
+  color: var(--ink-50);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+[data-theme="dark"] .day-picker-cell.selected {
+  background: var(--accent-light);
+  border-color: var(--accent-light);
+  color: #1a1815;
+}
+
+.day-picker-note {
+  margin-top: 10px;
+  font-size: 0.72rem;
+  color: var(--ink-500);
+  line-height: 1.4;
+}
+
+/* ---- Mes contable: preview ---- */
+
+.accounting-preview { margin-top: 18px; }
+.accounting-preview-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 10px 14px;
+  background: var(--ink-50);
+  border: 1px solid var(--ink-200);
+  border-radius: var(--radius-sm);
+}
+[data-theme="dark"] .accounting-preview-list {
+  background: var(--ink-100);
+  border-color: var(--ink-200);
+}
+.accounting-preview-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 4px 0;
+  font-size: 0.88rem;
+}
+.accounting-preview-label {
+  flex: 0 0 auto;
+  min-width: 120px;
+  color: var(--ink-900);
+  font-weight: 500;
+}
+.accounting-preview-range {
+  flex: 1;
+  color: var(--ink-700);
+  font-size: 0.82rem;
+}
 
 /* ---- Buttons ---- */
 
@@ -531,9 +773,22 @@ select.form-input {
   line-height: 1.4;
 }
 
-.badge-recurring { background: rgba(39,174,96,0.1); color: var(--green); }
-.badge-annual    { background: rgba(196,122,26,0.12); color: var(--accent); }
-.badge           { background: var(--ink-100); color: var(--ink-500); }
+.badge-recurring  { background: rgba(39,174,96,0.10); color: var(--green); }
+.badge-annual     { background: rgba(196,122,26,0.12); color: var(--accent); }
+.badge-annualized { background: rgba(196,122,26,0.12); color: var(--accent); }
+.badge-yearly     { background: rgba(192,57,43,0.10);  color: var(--red); }
+.badge            { background: var(--ink-100); color: var(--ink-500); }
+
+/* Marca discreta en gastos materializados desde un recurrente. */
+.expense-recurring-mark {
+  display: inline-flex;
+  align-items: center;
+  color: var(--ink-500);
+  opacity: 0.7;
+  cursor: help;
+}
+.expense-recurring-mark:hover { opacity: 1; color: var(--accent); }
+[data-theme="dark"] .expense-recurring-mark:hover { color: var(--accent-light); }
 
 /* ---- Recurring list ---- */
 
@@ -597,11 +852,15 @@ select.form-input {
 
 /* ---- Categories ---- */
 
-.category-form {
-  display: block;
-  margin-bottom: 0;
+.category-add-btn {
+  width: 100%;
+  margin: 12px 0 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
 }
-.category-form .form-group { flex: 1; min-width: 120px; }
+.category-add-btn svg { display: block; }
 
 .category-list { display: flex; flex-direction: column; gap: 6px; }
 
@@ -616,47 +875,44 @@ select.form-input {
 .category-row:hover .btn-delete,
 .category-row:hover .btn-edit { opacity: 1; }
 
-.category-row--editing {
-  flex-direction: column;
-  align-items: stretch;
-  background: var(--ink-100);
-  gap: 10px;
-  padding: 14px;
-}
-.category-row--editing:hover { background: var(--ink-100); }
-
-.category-edit-row {
+/* Modal de creación/edición de categoría */
+.category-preview {
   display: flex;
-  gap: 8px;
   align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  background: var(--ink-50);
+  border: 1px solid var(--ink-200);
+  border-radius: var(--radius-sm);
+  margin-bottom: 16px;
   flex-wrap: wrap;
 }
-
-/* Picker específico para edición inline de categoría — compacto y autocontenido */
-.icon-picker--cat-edit {
-  grid-template-columns: repeat(auto-fill, 36px);
-  grid-auto-rows: 36px;
-  gap: 4px;
-  padding: 6px;
-  background: transparent;
-  border: 1px dashed var(--ink-200);
-  height: fit-content;
-  width: 100%;
+[data-theme="dark"] .category-preview {
+  background: var(--ink-100);
 }
-.icon-picker--cat-edit .icon-pick-item {
-  padding: 4px;
+.category-preview-name {
+  flex: 1;
+  font-weight: 600;
+  color: var(--ink-900);
+  font-size: 1rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.category-preview-limit {
+  font-size: 0.82rem;
+  color: var(--ink-500);
+  flex-shrink: 0;
+}
+
+.category-modal-form {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
 }
 
 /* ---- Límites mensuales ---- */
-
-.category-limit-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 12px;
-  flex-wrap: wrap;
-}
-.category-limit-row .form-label { margin-bottom: 0; }
 
 .category-limit {
   font-size: 0.78rem;
@@ -759,10 +1015,9 @@ select.form-input {
   .chart-center-amount { font-size: 1.4rem; }
   .chart-wrapper { height: 260px; }
   .chart-legend { grid-template-columns: 1fr; }
-  .expense-form, .recurring-form { grid-template-columns: 1fr; }
+  .expense-form, .recurring-form, .category-modal-form { grid-template-columns: 1fr; }
   .amount-input { font-size: 1.3rem; }
   .expense-row { padding: 10px 16px; }
-  .category-form { flex-direction: column; align-items: stretch; }
   .legend-value { display: none; }
 }
 
@@ -866,18 +1121,6 @@ select.form-input {
   border-color: var(--accent);
 }
 
-.category-form-row {
-  display: flex;
-  gap: 8px;
-  align-items: stretch;
-  flex-wrap: wrap;
-}
-.category-form-row .color-input { flex-shrink: 0; }
-@media (max-width: 600px) {
-  .category-form-row { flex-direction: row; }
-  .category-form-row .form-input { width: 100%; }
-}
-
 /* ---- Edición inline de gasto ---- */
 
 .btn-edit {
@@ -901,6 +1144,11 @@ select.form-input {
 .recurring-row .btn-edit { opacity: 0.7; }
 .recurring-row:hover .btn-edit,
 .recurring-row .btn-edit:hover { opacity: 1; }
+
+/* Botón pausar/activar de recurrente: comparte estilo con .btn-edit pero
+   colorea distinto en hover según esté activo (verde→pausar) o pausado (ámbar→reanudar). */
+.recurring-row .btn-toggle:hover { color: var(--green); background: rgba(39,174,96,0.10); }
+.recurring-row.inactive .btn-toggle:hover { color: var(--accent); background: rgba(196,122,26,0.10); }
 
 .expense-row--editing {
   flex-direction: column;
@@ -1337,55 +1585,6 @@ select.form-input {
 .savings-chart-wrap {
   height: 240px;
   margin-top: 12px;
-}
-
-/* ---- Gastos compartidos ---- */
-
-.people-add-row {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-}
-
-.people-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 9px 12px;
-  background: var(--ink-50);
-  border-radius: var(--radius-sm);
-}
-.people-row:hover .btn-delete { opacity: 1; }
-.people-name { font-weight: 500; }
-
-.settlement-card { margin-top: 0; }
-
-.settlement-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 0;
-  border-bottom: 1px solid var(--ink-100);
-  font-size: 0.9rem;
-}
-.settlement-row:last-of-type { border-bottom: none; }
-
-.settlement-from { font-weight: 600; color: var(--red); }
-.settlement-arrow { color: var(--ink-500); }
-.settlement-to    { font-weight: 600; color: var(--green); flex: 1; }
-.settlement-amount { font-weight: 700; }
-
-.settlement-summary {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.settlement-summary-row {
-  display: flex;
-  justify-content: space-between;
-  font-size: 0.86rem;
-  color: var(--ink-700);
 }
 
 /* ---- Importar / Exportar ---- */
@@ -2054,9 +2253,6 @@ button.month-nav-text:hover { background: var(--ink-100); }
   .full-width { grid-column: 1 / -1; }
 
   /* Categorías */
-  .category-form,
-  .category-form-row { flex-direction: column; gap: 10px; }
-  .category-form-row .form-input { width: 100%; }
   .category-row { flex-wrap: wrap; gap: 8px; padding: 10px 12px; }
   .category-limit-row { flex-direction: column; align-items: stretch; }
 
@@ -2092,8 +2288,50 @@ button.month-nav-text:hover { background: var(--ink-100); }
   .expense-desc { font-size: 0.92rem; }
   .expense-meta { font-size: 0.78rem; }
 
-  /* Recurrentes */
-  .recurring-row { flex-wrap: wrap; gap: 8px; padding: 10px 12px; }
+  /* Recurrentes: grid de 4 filas para evitar solapes
+     Fila 1: dot + nombre (+ badge expirado)
+     Fila 2: importe destacado (full width)
+     Fila 3: meta (categoría · periodicidad)
+     Fila 4: rango de fechas + botones a la derecha */
+  .recurring-row {
+    display: grid;
+    grid-template-columns: auto 1fr auto auto auto;
+    grid-template-areas:
+      "dot    name    name    name    name"
+      "amount amount  amount  amount  amount"
+      "meta   meta    meta    meta    meta"
+      "range  range   toggle  edit    delete";
+    column-gap: 8px;
+    row-gap: 4px;
+    align-items: center;
+    padding: 12px 14px;
+  }
+  .recurring-row > .dot {
+    grid-area: dot;
+    align-self: center;
+  }
+  /* expense-info usa display: contents para que sus hijos sean grid items
+     directos y se puedan ubicar en áreas individuales. */
+  .recurring-row > .expense-info { display: contents; }
+  .recurring-row .recurring-desc-line { grid-area: name; min-width: 0; }
+  .recurring-row .expense-meta { grid-area: meta; min-width: 0; }
+  .recurring-row .recurring-range {
+    grid-area: range;
+    align-self: center;
+  }
+  .recurring-row > .expense-amount {
+    grid-area: amount;
+    font-size: 1.05rem;
+    justify-self: start;
+    margin: 0;
+    white-space: normal;
+  }
+  /* .btn-toggle se declara primero y con especificidad mayor (.btn-edit.btn-toggle)
+     porque el botón también tiene la clase .btn-edit y si no, la regla siguiente
+     lo movería a la columna de edit. */
+  .recurring-row > .btn-edit.btn-toggle { grid-area: toggle; justify-self: end; }
+  .recurring-row > .btn-edit            { grid-area: edit;   justify-self: end; }
+  .recurring-row > .btn-delete          { grid-area: delete; justify-self: end; }
 
   /* Edición inline */
   .edit-row-fields { flex-direction: column; gap: 10px; width: 100%; }
@@ -2101,8 +2339,6 @@ button.month-nav-text:hover { background: var(--ink-100); }
   .edit-row-actions { width: 100%; justify-content: stretch; }
   .edit-row-actions .btn { flex: 1; }
   .expense-row--editing { flex-direction: column; align-items: stretch; }
-  .category-edit-row { flex-wrap: wrap; gap: 8px; }
-  .category-edit-row .form-input { flex: 1 1 100% !important; min-width: 0 !important; }
 
   /* Ahorro */
   .savings-stats { grid-template-columns: 1fr; }
@@ -2133,10 +2369,6 @@ button.month-nav-text:hover { background: var(--ink-100); }
   }
   .income-month { font-size: 0.75rem; }
 
-  /* Settlement */
-  .settlement-row { flex-wrap: wrap; gap: 6px; }
-  .settlement-amount { margin-left: auto; }
-
   /* Import / Export */
   .ie-export-row { flex-direction: column; gap: 8px; }
   .ie-export-row .btn { width: 100%; }
@@ -2157,15 +2389,6 @@ button.month-nav-text:hover { background: var(--ink-100); }
     padding: 8px;
   }
   .icon-pick-item { padding: 6px; }
-
-  /* Override mobile para picker de edición inline (más compacto) */
-  .icon-picker--cat-edit {
-    grid-template-columns: repeat(auto-fill, 32px);
-    grid-auto-rows: 32px;
-    gap: 3px;
-    padding: 5px;
-  }
-  .icon-picker--cat-edit .icon-pick-item { padding: 3px; }
 
   /* Modal a pantalla casi completa en móvil */
   .modal {
@@ -2274,8 +2497,7 @@ button.month-nav-text:hover { background: var(--ink-100); }
 
 .qa-cat-btn {
   background: var(--ink-50);
-  border: 1px solid var(--ink-200);
-  border-left: 3px solid var(--ink-300);
+  border: 2px solid var(--ink-200);
   border-radius: var(--radius-sm);
   padding: 10px 8px;
   cursor: pointer;
@@ -2283,27 +2505,32 @@ button.month-nav-text:hover { background: var(--ink-100); }
   flex-direction: column;
   align-items: center;
   gap: 5px;
-  transition: background 0.15s, transform 0.1s;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s;
   min-height: 64px;
+  color: var(--ink-700);
 }
 [data-theme="dark"] .qa-cat-btn { background: var(--ink-100); }
 .qa-cat-btn:hover { background: var(--ink-100); }
 .qa-cat-btn:active { transform: scale(0.97); }
 .qa-cat-btn.selected {
   background: var(--ink-100);
-  border-width: 2px;
-  border-left-width: 4px;
+  border-color: var(--accent);
+  color: var(--ink-900);
   font-weight: 600;
 }
-[data-theme="dark"] .qa-cat-btn.selected { background: var(--ink-200); }
+[data-theme="dark"] .qa-cat-btn.selected {
+  background: var(--ink-200);
+  border-color: var(--accent-light);
+}
 
 .qa-cat-name {
   font-size: 0.78rem;
-  color: var(--ink-900);
   text-align: center;
   line-height: 1.2;
 }
-.qa-cat-ico { display: flex; }
+.qa-cat-ico { display: flex; color: var(--ink-500); }
+.qa-cat-btn.selected .qa-cat-ico { color: var(--accent); }
+[data-theme="dark"] .qa-cat-btn.selected .qa-cat-ico { color: var(--accent-light); }
 
 .qa-submit { margin-top: 6px; }
 

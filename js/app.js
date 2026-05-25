@@ -15,9 +15,15 @@ let state = {
   recurring: [],
   income: [],
   annualGoal: 0,
-  people: [],
   tagFilter: null,
   view: 'dashboard',
+  // Set de recurringInstanceKey ya materializadas. Se reconstruye en cada reload
+  // y es consultado por getPendingForPeriod() y otros helpers en O(1).
+  materializedKeys: new Set(),
+  // Día (1-28) en el que empieza el mes contable. 1 = mes natural (default).
+  // El mes contable lleva el nombre del mes en que TERMINA (convención bancaria):
+  // payrollDay=25 → "Mayo 2026" = 25-abril → 24-mayo.
+  payrollDay: 1,
 };
 
 /* ================================================================
@@ -27,6 +33,7 @@ let state = {
 document.addEventListener('DOMContentLoaded', async () => {
   await DB.open();
   await DB.seedCategories();
+  await materializeRecurrings();
   await reload();
   bindGlobalEvents();
 });
@@ -35,12 +42,18 @@ async function reload() {
   [state.categories, state.expenses, state.recurring, state.income] = await Promise.all([
     DB.getCategories(), DB.getExpenses(), DB.getRecurring(), DB.getAllIncome(),
   ]);
-  const [goalEntry, peopleEntry] = await Promise.all([
+  const [goalEntry, payrollEntry] = await Promise.all([
     DB.getSetting('annual-goal'),
-    DB.getSetting('people'),
+    DB.getSetting('payroll-day'),
   ]);
-  state.annualGoal = goalEntry?.value  || 0;
-  state.people     = peopleEntry?.value || [];
+  state.annualGoal = goalEntry?.value || 0;
+  const pd = payrollEntry?.value;
+  state.payrollDay = (typeof pd === 'number' && pd >= 1 && pd <= 28) ? pd : 1;
+  // Reconstruye el set de instanceKeys materializadas (consultado en getPendingForPeriod).
+  state.materializedKeys = new Set();
+  for (const e of state.expenses) {
+    if (e.recurringInstanceKey) state.materializedKeys.add(e.recurringInstanceKey);
+  }
   render();
 }
 
@@ -174,10 +187,67 @@ function ymKey(year, month) {
   return `${year}-${String(month).padStart(2, '0')}`;
 }
 
-/** 'YYYY-MM' del mes real en curso. */
+/** 'YYYY-MM' del mes contable real en curso (depende de state.payrollDay). */
 function currentYmKey() {
   const d = new Date();
-  return ymKey(d.getFullYear(), d.getMonth() + 1);
+  const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  return accountingMonth(iso, state.payrollDay);
+}
+
+/* ---- Helpers de mes contable ----
+ *
+ * payrollDay = 1 → mes contable = mes natural (default).
+ * payrollDay ∈ [2..28] → el mes contable empieza ese día del mes natural anterior
+ * y termina el día (payrollDay-1) del mes natural homónimo.
+ *
+ * Ejemplo payrollDay=25:
+ *   "Mayo 2026"  = 25-abril-2026 → 24-mayo-2026
+ *   "Junio 2026" = 25-mayo-2026  → 24-junio-2026
+ *
+ * Se nombra por el mes en que TERMINA (convención bancaria). */
+
+/** Devuelve el 'YYYY-MM' del mes contable al que pertenece una fecha ISO. */
+function accountingMonth(isoDate, payrollDay = 1) {
+  if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) return null;
+  const y = parseInt(isoDate.slice(0, 4), 10);
+  const m = parseInt(isoDate.slice(5, 7), 10);
+  const d = parseInt(isoDate.slice(8, 10), 10);
+  if (!payrollDay || payrollDay <= 1) return `${y}-${String(m).padStart(2,'0')}`;
+  // Si el día es >= payrollDay, la fecha pertenece al periodo que TERMINA el mes siguiente.
+  if (d >= payrollDay) {
+    if (m === 12) return `${y + 1}-01`;
+    return `${y}-${String(m + 1).padStart(2,'0')}`;
+  }
+  return `${y}-${String(m).padStart(2,'0')}`;
+}
+
+/** Rango ISO [startDate, endDate] del mes contable nombrado (year, month). */
+function monthBounds(year, month, payrollDay = 1) {
+  if (!payrollDay || payrollDay <= 1) {
+    const lastDay = new Date(year, month, 0).getDate();
+    return [
+      `${year}-${String(month).padStart(2,'0')}-01`,
+      `${year}-${String(month).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`,
+    ];
+  }
+  let sy = year, sm = month - 1;
+  if (sm === 0) { sm = 12; sy = year - 1; }
+  const startISO = `${sy}-${String(sm).padStart(2,'0')}-${String(payrollDay).padStart(2,'0')}`;
+  const endISO   = `${year}-${String(month).padStart(2,'0')}-${String(payrollDay - 1).padStart(2,'0')}`;
+  return [startISO, endISO];
+}
+
+/** ¿La fecha ISO cae dentro del mes contable (year, month)? */
+function isInAccountingMonth(isoDate, year, month, payrollDay = 1) {
+  if (!isoDate) return false;
+  return accountingMonth(isoDate, payrollDay) === ymKey(year, month);
+}
+
+/** ¿La fecha ISO cae dentro del año contable (los 12 meses contables de ese year)? */
+function isInAccountingYear(isoDate, year, payrollDay = 1) {
+  if (!isoDate) return false;
+  const ym = accountingMonth(isoDate, payrollDay);
+  return ym != null && ym.startsWith(String(year));
 }
 
 /** Convierte 'YYYY-MM' a una etiqueta legible "Ene 2025". */
@@ -202,14 +272,166 @@ function isRecurringExpired(r) {
   return !!(r.endMonth && r.endMonth < currentYmKey());
 }
 
-/** Nº de meses (0..12) que un recurrente está activo dentro de un año dado. */
-function recurringMonthsInYear(r, year) {
-  if (!r.active) return 0;
-  let count = 0;
-  for (let m = 1; m <= 12; m++) {
-    if (isRecurringActiveIn(r, year, m)) count++;
+/** Último día válido del (year, month). Mes 1-12. */
+function lastDayOfMonth(year, month) {
+  return new Date(year, month, 0).getDate();
+}
+
+/** Día efectivo de cobro en (year, month) dado un paymentDay deseado.
+ *  Si paymentDay > último día disponible (29/30/31 en febrero, 31 en abril...),
+ *  cae al último día del mes. */
+function effectiveDay(paymentDay, year, month) {
+  return Math.min(paymentDay || 1, lastDayOfMonth(year, month));
+}
+
+/** Clave única de instancia: 'YYYY-MM-<recurringId>'. Usada para idempotencia.
+ *  Para recurrentes 'annual' (one-shot) el MM es el paymentMonth, lo que garantiza
+ *  una sola materialización por año (solo se ejecuta en su mes). */
+function buildInstanceKey(year, month, recurringId) {
+  return `${ymKey(year, month)}-${recurringId}`;
+}
+
+/** Devuelve la frecuencia normalizada: 'monthly' | 'annualized' | 'annual'.
+ *  Fallback para registros pre-v4 que solo tenían el bool annual. */
+function getFrequency(r) {
+  if (r.frequency) return r.frequency;
+  return r.annual ? 'annualized' : 'monthly';
+}
+
+/** ¿El recurrente ya tiene un gasto materializado en (year, month)?
+ *  Si lo tiene, la proyección NO debe sumarse para no duplicar.
+ *  O(1) gracias al Set state.materializedKeys que se reconstruye en reload(). */
+function hasMaterializedExpense(recurringId, year, month) {
+  return state.materializedKeys.has(buildInstanceKey(year, month, recurringId));
+}
+
+/** Devuelve los recurrentes que aún tienen una materialización pendiente
+ *  dentro del rango del mes contable (year, month). Cada entrada incluye la
+ *  fecha esperada, el importe que se aplicaría y una referencia al recurrente.
+ *  Read-only: se materializa cuando llega el día (en boot o tras editar). */
+function getPendingForPeriod(year, month) {
+  const payrollDay = state.payrollDay || 1;
+  const [periodStart, periodEnd] = monthBounds(year, month, payrollDay);
+  const out = [];
+
+  // Calendar months que se solapan con el periodo contable (siempre 1 o 2).
+  const overlapped = new Set();
+  overlapped.add(periodStart.slice(0, 7));
+  overlapped.add(periodEnd.slice(0, 7));
+
+  for (const r of state.recurring) {
+    if (!r.active) continue;
+    if (!r.paymentDay) continue;
+    const freq = getFrequency(r);
+
+    if (freq === 'annual') {
+      if (!r.paymentMonth) continue;
+      // Para anual one-shot, buscamos en los años del rango (suelen ser 1).
+      const years = new Set([periodStart.slice(0, 4), periodEnd.slice(0, 4)]);
+      for (const yStr of years) {
+        const y = parseInt(yStr, 10);
+        if (!isRecurringActiveIn(r, y, r.paymentMonth)) continue;
+        const day = effectiveDay(r.paymentDay, y, r.paymentMonth);
+        const dateStr = `${y}-${String(r.paymentMonth).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+        if (dateStr < periodStart || dateStr > periodEnd) continue;
+        if (hasMaterializedExpense(r.id, y, r.paymentMonth)) continue;
+        out.push({ recurring: r, date: dateStr, amountCents: materializationAmount(r), freq });
+      }
+      continue;
+    }
+
+    // monthly / annualized: una materialización por mes natural.
+    for (const ym of overlapped) {
+      const [yStr, mStr] = ym.split('-');
+      const y = parseInt(yStr, 10);
+      const m = parseInt(mStr, 10);
+      if (!isRecurringActiveIn(r, y, m)) continue;
+      const day = effectiveDay(r.paymentDay, y, m);
+      const dateStr = `${ym}-${String(day).padStart(2,'0')}`;
+      if (dateStr < periodStart || dateStr > periodEnd) continue;
+      if (hasMaterializedExpense(r.id, y, m)) continue;
+      out.push({ recurring: r, date: dateStr, amountCents: materializationAmount(r), freq });
+    }
   }
-  return count;
+
+  out.sort((a, b) => a.date.localeCompare(b.date));
+  return out;
+}
+
+/* ================================================================
+   Materialización de recurrentes
+   ================================================================ */
+
+/** Importe de una materialización individual según la frecuencia.
+ *    - monthly:    el importe íntegro (es lo que se paga cada mes)
+ *    - annualized: importe/12 (el total anual se reparte en 12 cuotas mensuales)
+ *    - annual:     el importe íntegro (un único pago al año) */
+function materializationAmount(r) {
+  if (getFrequency(r) === 'annualized') {
+    return Math.round(r.amountCents / 12);
+  }
+  return r.amountCents;
+}
+
+/** Materialización con ventana de lookback de 3 meses.
+ *  En cada boot/edición, recorre los meses [actual-2, actual-1, actual] y, para
+ *  cada recurrente activo, crea el gasto si corresponde:
+ *    - monthly:    cada mes en su paymentDay (o último día disponible)
+ *    - annualized: igual que monthly pero con importe/12
+ *    - annual:     solo en su paymentMonth, en su paymentDay
+ *  La idempotencia (recurringInstanceKey) garantiza que no se duplica.
+ *
+ *  Notas:
+ *  - Si el usuario borra manualmente un gasto materializado, puede re-crearse
+ *    dentro de la ventana de 3 meses. Para saltar un mes, pausar el recurrente
+ *    o usar el rango hasta/desde son las vías actuales.
+ *  - Para meses dentro de la ventana pero futuros respecto a hoy, solo se
+ *    materializa si el día efectivo ya pasó (lo que solo puede ocurrir en el
+ *    mes actual; meses pasados completos se materializan siempre). */
+async function materializeRecurrings() {
+  const now = new Date();
+  const todayDay = now.getDate();
+  const curYear  = now.getFullYear();
+  const curMonth = now.getMonth() + 1;
+
+  // Ventana: 3 meses (actual + 2 anteriores).
+  const window = [];
+  for (let i = 2; i >= 0; i--) {
+    let yy = curYear, mm = curMonth - i;
+    while (mm <= 0) { mm += 12; yy--; }
+    window.push({ year: yy, month: mm });
+  }
+
+  const recurrings = await DB.getRecurring();
+
+  for (const { year, month } of window) {
+    const isCurrentMonth = (year === curYear && month === curMonth);
+    for (const r of recurrings) {
+      if (!r.active) continue;
+      if (!r.paymentDay) continue;
+      const freq = getFrequency(r);
+      if (!isRecurringActiveIn(r, year, month)) continue;
+      // Anual one-shot: solo se materializa en su paymentMonth.
+      if (freq === 'annual' && month !== r.paymentMonth) continue;
+
+      const day = effectiveDay(r.paymentDay, year, month);
+      if (isCurrentMonth && todayDay < day) continue;
+
+      const instanceKey = buildInstanceKey(year, month, r.id);
+      if (await DB.hasExpenseByInstanceKey(instanceKey)) continue;
+
+      const dateStr = `${ymKey(year, month)}-${String(day).padStart(2, '0')}`;
+      await DB.addExpense({
+        date: dateStr,
+        amountCents: materializationAmount(r),
+        description: r.name,
+        categoryId: r.categoryId,
+        tags: [],
+        sourceRecurringId: r.id,
+        recurringInstanceKey: instanceKey,
+      });
+    }
+  }
 }
 
 function downloadFile(content, filename, mime) {
@@ -240,7 +462,6 @@ function exportJSON() {
     recurring:  state.recurring,
     income:     state.income,
     annualGoal: state.annualGoal,
-    people:     state.people,
     exportedAt: new Date().toISOString(),
     version: 1,
   };
@@ -248,7 +469,7 @@ function exportJSON() {
 }
 
 function exportCSV() {
-  const header = ['Fecha', 'Importe (€)', 'Categoría', 'Descripción', 'Etiquetas', 'Pagado por'];
+  const header = ['Fecha', 'Importe (€)', 'Categoría', 'Descripción', 'Etiquetas'];
   const rows = [...state.expenses]
     .sort((a, b) => (a.date || '').localeCompare(b.date || ''))
     .map(e => {
@@ -259,7 +480,6 @@ function exportCSV() {
         cat?.name || '',
         e.description || '',
         (e.tags || []).map(t => '#' + t).join(' '),
-        e.paidBy || '',
       ];
     });
   const csv = [header, ...rows]
@@ -277,10 +497,15 @@ async function applyJSONImport(backup, mode) {
     await DB.clearAll();
     for (const c of backup.categories || []) await DB.putCategory(c);
     for (const e of backup.expenses   || []) await DB.putExpense(e);
-    for (const r of backup.recurring  || []) await DB.putRecurring(r);
+    // Recurrentes: garantizar paymentDay y frequency para backups antiguos.
+    for (const r of backup.recurring  || []) {
+      const rr = { ...r };
+      if (rr.paymentDay == null) rr.paymentDay = 1;
+      if (!rr.frequency) rr.frequency = rr.annual ? 'annualized' : 'monthly';
+      await DB.putRecurring(rr);
+    }
     for (const inc of backup.income   || []) await DB.putIncome(inc);
     await DB.setSetting('annual-goal', backup.annualGoal || 0);
-    await DB.setSetting('people',      backup.people     || []);
     // Las categorías por defecto se siembran si no quedó ninguna en el backup.
     await DB.seedCategories();
     return;
@@ -308,7 +533,10 @@ async function applyJSONImport(backup, mode) {
   }
 
   for (const e of backup.expenses || []) {
-    const { id, ...rest } = e;
+    const { id, sourceRecurringId, recurringInstanceKey, ...rest } = e;
+    // Stripamos vínculos a recurrentes: en merge, los IDs de recurrentes
+    // se reasignan y los keys antiguos quedarían huérfanos (o peor, chocarían
+    // con los nuevos materializados). El gasto se conserva pero "desvinculado".
     if (rest.categoryId != null && idMap.has(rest.categoryId)) {
       rest.categoryId = idMap.get(rest.categoryId);
     }
@@ -320,6 +548,8 @@ async function applyJSONImport(backup, mode) {
     if (rest.categoryId != null && idMap.has(rest.categoryId)) {
       rest.categoryId = idMap.get(rest.categoryId);
     }
+    if (rest.paymentDay == null) rest.paymentDay = 1; // default para backups v2
+    if (!rest.frequency) rest.frequency = rest.annual ? 'annualized' : 'monthly';
     await DB.addRecurring(rest);
   }
 
@@ -452,6 +682,7 @@ function render() {
     case 'reports':    renderReports(main); break;
     case 'savings':    renderSavings(main); break;
     case 'categories': renderCategories(main); break;
+    case 'accounting': renderAccountingMonth(main); break;
   }
 
   // FAB visible solo si la app está lista (no en vista categories donde estorba)
@@ -473,13 +704,12 @@ const onIdle = (fn) => {
    ================================================================ */
 
 function computeMonthTotal(year, month) {
-  const exp = state.expenses.filter(e => isInMonth(e.date, year, month));
-  const expTotal   = exp.reduce((s, e) => s + e.amountCents, 0);
-  const annualMo   = state.recurring.filter(r => isRecurringActiveIn(r, year, month) && r.annual)
-    .reduce((s, r) => s + Math.round(r.amountCents / 12), 0);
-  const recurringT = state.recurring.filter(r => isRecurringActiveIn(r, year, month) && !r.annual)
-    .reduce((s, r) => s + r.amountCents, 0);
-  return { total: expTotal + annualMo + recurringT, expCount: exp.length };
+  const exp = state.expenses.filter(e => isInAccountingMonth(e.date, year, month, state.payrollDay));
+  const total = exp.reduce((s, e) => s + e.amountCents, 0);
+  // Solo gasto REAL. Las proyecciones (recurrentes no materializados aún) se
+  // muestran en el bloque "Pendiente del mes contable" y en la card Proyección
+  // fin de mes, pero NO se suman al total real.
+  return { total, expCount: exp.length };
 }
 
 function getMonthIncome(year, month) {
@@ -489,21 +719,14 @@ function getMonthIncome(year, month) {
 }
 
 function computeCatBreakdown(year, month) {
-  const exp = state.expenses.filter(e => isInMonth(e.date, year, month));
+  const exp = state.expenses.filter(e => isInAccountingMonth(e.date, year, month, state.payrollDay));
   const byCat = {};
   state.categories.forEach(c => { byCat[c.id] = { ...c, totalCents: 0 }; });
   let uncatTotal = 0;
+  // Solo gastos reales del periodo (los materializados de recurrente ya están aquí).
   exp.forEach(e => {
     if (byCat[e.categoryId]) byCat[e.categoryId].totalCents += e.amountCents;
     else uncatTotal += e.amountCents;
-  });
-  state.recurring.filter(r => isRecurringActiveIn(r, year, month) && !r.annual).forEach(r => {
-    if (byCat[r.categoryId]) byCat[r.categoryId].totalCents += r.amountCents;
-    else uncatTotal += r.amountCents;
-  });
-  state.recurring.filter(r => isRecurringActiveIn(r, year, month) && r.annual).forEach(r => {
-    if (byCat[r.categoryId]) byCat[r.categoryId].totalCents += Math.round(r.amountCents / 12);
-    else uncatTotal += Math.round(r.amountCents / 12);
   });
   if (uncatTotal > 0) {
     byCat['__uncat__'] = { id: '__uncat__', name: 'Sin categoría', color: '#7f8c8d', icon: 'package', totalCents: uncatTotal };
@@ -516,40 +739,34 @@ function computeCatBreakdown(year, month) {
    ================================================================ */
 
 function renderDashboard(container) {
-  // Gastos del mes seleccionado
-  const monthExpenses = state.expenses.filter(
-    e => isInMonth(e.date, state.year, state.month)
-  );
+  const { year, month } = state;
+  // Gastos REALES del mes contable seleccionado (ad-hoc + materializados de recurrente).
+  const monthExpenses = state.expenses.filter(e => isInAccountingMonth(e.date, year, month, state.payrollDay));
 
-  // Gastos anualizados prorrateados (/12) — solo los activos en este mes
-  const activeAnnual = state.recurring.filter(r => isRecurringActiveIn(r, state.year, state.month) && r.annual);
-  const annualMonthly = activeAnnual.reduce((s, r) => s + Math.round(r.amountCents / 12), 0);
+  // Dos buckets reales:
+  //   variableExpenses: gastos puntuales (sin sourceRecurringId)
+  //   fixedExpenses:    gastos con origen recurrente (con sourceRecurringId)
+  const variableExpenses = monthExpenses.filter(e => !e.sourceRecurringId);
+  const fixedExpenses    = monthExpenses.filter(e =>  e.sourceRecurringId);
+  const variableTotal    = variableExpenses.reduce((s, e) => s + e.amountCents, 0);
+  const fixedRealTotal   = fixedExpenses.reduce((s, e) => s + e.amountCents, 0);
 
-  // Gastos recurrentes mensuales — solo los activos en este mes
-  const activeMonthly = state.recurring.filter(r => isRecurringActiveIn(r, state.year, state.month) && !r.annual);
-  const recurringTotal = activeMonthly.reduce((s, r) => s + r.amountCents, 0);
+  // Total REAL = lo único que cuenta para "Total".
+  const realTotal = variableTotal + fixedRealTotal;
 
-  // Totales
-  const expensesTotal = monthExpenses.reduce((s, e) => s + e.amountCents, 0);
-  const grandTotal = expensesTotal + annualMonthly + recurringTotal;
+  // Pendiente: recurrentes que aún no se han materializado dentro de este periodo
+  // contable. Se muestra como mini-card aparte y suma al "Esperado fin de mes".
+  const pending = getPendingForPeriod(year, month);
+  const pendingTotal = pending.reduce((s, p) => s + p.amountCents, 0);
+  const expectedTotal = realTotal + pendingTotal;
 
-  // Agrupa por categoría (para el donut). Los gastos huérfanos (categoría borrada)
-  // se acumulan en un bucket sintético "Sin categoría" para que el donut sume el total real.
+  // Donut por categoría — solo sobre GASTO REAL.
   const byCat = {};
   state.categories.forEach(c => { byCat[c.id] = { ...c, totalCents: 0 }; });
   let uncatTotal = 0;
-
   monthExpenses.forEach(e => {
     if (byCat[e.categoryId]) byCat[e.categoryId].totalCents += e.amountCents;
     else uncatTotal += e.amountCents;
-  });
-  activeMonthly.forEach(r => {
-    if (byCat[r.categoryId]) byCat[r.categoryId].totalCents += r.amountCents;
-    else uncatTotal += r.amountCents;
-  });
-  activeAnnual.forEach(r => {
-    if (byCat[r.categoryId]) byCat[r.categoryId].totalCents += Math.round(r.amountCents / 12);
-    else uncatTotal += Math.round(r.amountCents / 12);
   });
 
   const chartData = Object.values(byCat).filter(c => c.totalCents > 0)
@@ -604,7 +821,7 @@ function renderDashboard(container) {
   const leftCol = el('div', { class: 'card chart-card' });
   const chartHeader = el('div', { class: 'card-header' },
     el('h2', { class: 'card-title', text: 'Distribución por categoría' }),
-    el('span', { class: 'badge', text: `${monthExpenses.length + activeMonthly.length + activeAnnual.length} conceptos` }),
+    el('span', { class: 'badge', text: `${monthExpenses.length} gasto${monthExpenses.length !== 1 ? 's' : ''}` }),
   );
   leftCol.appendChild(chartHeader);
 
@@ -613,10 +830,10 @@ function renderDashboard(container) {
   const canvas = el('canvas', { id: 'donut-canvas' });
   chartWrap.appendChild(canvas);
 
-  // Total central (overlay encima del donut, lo hacemos con CSS)
+  // Total central — solo real
   const centerOverlay = el('div', { class: 'chart-center' },
     el('span', { class: 'chart-center-label', text: 'Total mes' }),
-    el('span', { class: 'chart-center-amount', text: fmtEUR(grandTotal) }),
+    el('span', { class: 'chart-center-amount', text: fmtEUR(realTotal) }),
   );
   chartWrap.appendChild(centerOverlay);
   leftCol.appendChild(chartWrap);
@@ -625,7 +842,7 @@ function renderDashboard(container) {
   if (chartData.length > 0) {
     const legend = el('div', { class: 'chart-legend' });
     chartData.forEach(c => {
-      const pct = grandTotal > 0 ? ((c.totalCents / grandTotal) * 100).toFixed(1) : '0.0';
+      const pct = realTotal > 0 ? ((c.totalCents / realTotal) * 100).toFixed(1) : '0.0';
       const nameSpan = el('span', { class: 'legend-name' });
       appendIconText(nameSpan, c.icon, c.name, 12);
       legend.appendChild(
@@ -645,19 +862,26 @@ function renderDashboard(container) {
   // Columna derecha: formulario + resumen
   const rightCol = el('div', { class: 'right-col' });
 
-  // Resumen rápido
+  // Resumen rápido — todo en REAL.
   const summary = el('div', { class: 'card summary-card' });
   summary.appendChild(el('h2', { class: 'card-title', text: 'Resumen del mes' }));
   const summaryGrid = el('div', { class: 'summary-grid' });
-  summaryGrid.appendChild(summaryItem('Gastos puntuales', expensesTotal, monthExpenses.length));
-  summaryGrid.appendChild(summaryItem('Fijos mensuales', recurringTotal, activeMonthly.length));
-  summaryGrid.appendChild(summaryItem('Anualizados (/12)', annualMonthly, activeAnnual.length));
+  summaryGrid.appendChild(summaryItem('Puntuales', variableTotal, variableExpenses.length));
+  summaryGrid.appendChild(summaryItem('Fijos (origen recurrente)', fixedRealTotal, fixedExpenses.length));
   summary.appendChild(summaryGrid);
   const totalRow = el('div', { class: 'summary-total' },
-    el('span', { text: 'Total' }),
-    el('span', { class: 'mono', text: fmtEUR(grandTotal) }),
+    el('span', { text: 'Total real' }),
+    el('span', { class: 'mono', text: fmtEUR(realTotal) }),
   );
   summary.appendChild(totalRow);
+  // Línea secundaria si hay pendientes en el periodo (esperado fin de mes).
+  if (pendingTotal > 0) {
+    const expectedRow = el('div', { class: 'summary-expected' },
+      el('span', { text: `Esperado fin de mes (${pending.length} pendiente${pending.length !== 1 ? 's' : ''})` }),
+      el('span', { class: 'mono', text: fmtEUR(expectedTotal) }),
+    );
+    summary.appendChild(expectedRow);
+  }
   rightCol.appendChild(summary);
 
   // Formulario
@@ -665,39 +889,74 @@ function renderDashboard(container) {
   grid.appendChild(rightCol);
   container.appendChild(grid);
 
-  // Lista de movimientos
-  container.appendChild(buildExpenseList(monthExpenses, activeMonthly, activeAnnual));
+  // Lista de gastos REALES
+  container.appendChild(buildExpenseList(monthExpenses));
 
-  // Liquidación de gastos compartidos
-  if (state.people.length >= 2) {
-    const sc = buildSettlementCard(monthExpenses);
-    if (sc) container.appendChild(sc);
+  // Mini-card de pendientes del mes contable
+  if (pending.length > 0) {
+    container.appendChild(buildPendingCard(pending));
   }
 
   // Proyección de fin de mes (al final; solo si miramos el mes actual)
   const projectionCard = buildProjectionCard({
     year: state.year,
     month: state.month,
-    expensesTotal,
-    recurringTotal,
-    annualMonthly,
-    monthExpenses,
+    variableTotal,
+    variableCount: variableExpenses.length,
+    fixedRealTotal,
+    pendingTotal,
   });
   if (projectionCard) container.appendChild(projectionCard);
 
   // Render chart
   requestAnimationFrame(() => {
     if (chartData.length > 0) {
-      DonutChart.render('donut-canvas', chartData, grandTotal);
+      DonutChart.render('donut-canvas', chartData, realTotal);
     } else {
       DonutChart.destroy();
       const wrap = document.querySelector('.chart-wrapper');
       if (wrap) {
         clear(wrap);
-        wrap.appendChild(el('div', { class: 'empty-state', text: 'Sin gastos este mes' }));
+        wrap.appendChild(el('div', { class: 'empty-state', text: 'Sin gastos reales este mes' }));
       }
     }
   });
+}
+
+/** Mini-card read-only con las materializaciones pendientes del periodo contable. */
+function buildPendingCard(pending) {
+  const card = el('div', { class: 'card pending-card' });
+  const total = pending.reduce((s, p) => s + p.amountCents, 0);
+  card.appendChild(
+    el('div', { class: 'card-header' },
+      el('h2', { class: 'card-title', text: 'Pendiente del mes contable' }),
+      el('span', { class: 'badge', text: `${pending.length} · ${fmtEUR(total)}` }),
+    )
+  );
+  card.appendChild(el('p', {
+    class: 'expense-meta',
+    style: { margin: '6px 0 12px' },
+    text: 'Recurrentes que aún no se han facturado en este periodo. Se crearán como gasto editable cuando llegue su día.',
+  }));
+
+  const list = el('div', { class: 'pending-list' });
+  pending.forEach(p => {
+    const r   = p.recurring;
+    const cat = state.categories.find(c => c.id === r.categoryId);
+    const row = el('div', { class: 'pending-row' });
+    row.appendChild(el('span', { class: 'dot', style: { backgroundColor: cat?.color || '#999' } }));
+    const info = el('div', { class: 'expense-info' });
+    const name = el('span', { class: 'expense-desc' });
+    appendIconText(name, cat?.icon, r.name, 13);
+    info.appendChild(name);
+    const meta = `${cat?.name || 'Sin categoría'} · ${fmtDate(p.date)}`;
+    info.appendChild(el('div', { class: 'expense-meta', text: meta }));
+    row.appendChild(info);
+    row.appendChild(el('span', { class: 'expense-amount mono', text: fmtEUR(p.amountCents) }));
+    list.appendChild(row);
+  });
+  card.appendChild(list);
+  return card;
 }
 
 function summaryItem(label, cents, count) {
@@ -710,19 +969,20 @@ function summaryItem(label, cents, count) {
 
 /** Card de proyección de fin de mes. Solo aparece si miramos el mes en curso
  *  (en meses pasados los totales ya son definitivos; en meses futuros no hay datos). */
-function buildProjectionCard({ year, month, expensesTotal, recurringTotal, annualMonthly, monthExpenses }) {
+function buildProjectionCard({ year, month, variableTotal, variableCount, fixedRealTotal, pendingTotal }) {
   const now = new Date();
   const isCurrentMonth = (year === now.getFullYear() && month === now.getMonth() + 1);
   if (!isCurrentMonth) return null;
 
   const daysInMonth = new Date(year, month, 0).getDate();
   const elapsed = Math.max(1, Math.min(now.getDate(), daysInMonth));
-  const fixedMonth = recurringTotal + annualMonthly;
+  // Bloque fijo del mes: lo ya materializado (real) + lo pendiente de materializar.
+  const fixedMonth = (fixedRealTotal || 0) + (pendingTotal || 0);
 
-  // Proyectamos solo los gastos puntuales (los fijos ya están imputados al mes)
-  const projectedVariable = Math.round((expensesTotal / elapsed) * daysInMonth);
+  // Proyectamos linealmente solo los puntuales (variable); los fijos se imputan tal cual.
+  const projectedVariable = Math.round((variableTotal / elapsed) * daysInMonth);
   const projectedTotal = projectedVariable + fixedMonth;
-  const actualSoFar = expensesTotal + fixedMonth;
+  const actualSoFar = variableTotal + (fixedRealTotal || 0);
   const pctOfProjected = projectedTotal > 0 ? Math.min(100, (actualSoFar / projectedTotal) * 100) : 0;
   const pctOfMonth = (elapsed / daysInMonth) * 100;
 
@@ -745,7 +1005,7 @@ function buildProjectionCard({ year, month, expensesTotal, recurringTotal, annua
   const meta = el('div', { class: 'projection-meta' });
   meta.appendChild(el('span', { text: `Día ${elapsed} de ${daysInMonth}` }));
   meta.appendChild(el('span', { class: 'mono', text: `Gastado ${fmtEUR(actualSoFar)}` }));
-  if (monthExpenses.length > 0) {
+  if (variableCount > 0) {
     meta.appendChild(el('span', { class: 'mono', text: `Por venir ~${fmtEUR(Math.max(0, projectedTotal - actualSoFar))}` }));
   } else {
     meta.appendChild(el('span', { class: 'projection-hint', text: 'Sin gastos puntuales aún' }));
@@ -825,18 +1085,6 @@ function buildExpenseForm() {
   tagsGroup.appendChild(tagsInput);
   form.appendChild(tagsGroup);
 
-  // Pagado por (solo si hay personas configuradas)
-  let paidBySelect = null;
-  if (state.people.length >= 2) {
-    const paidByGroup = el('div', { class: 'form-group full-width' });
-    paidByGroup.appendChild(el('label', { class: 'form-label', text: 'Pagado por' }));
-    paidBySelect = el('select', { class: 'form-input' });
-    paidBySelect.appendChild(el('option', { value: '', text: '— Gasto personal —' }));
-    state.people.forEach(p => paidBySelect.appendChild(el('option', { value: p, text: p })));
-    paidByGroup.appendChild(paidBySelect);
-    form.appendChild(paidByGroup);
-  }
-
   // Submit
   const submitBtn = el('button', { type: 'submit', class: 'btn btn-primary full-width', text: 'Guardar gasto' });
   form.appendChild(submitBtn);
@@ -852,12 +1100,10 @@ function buildExpenseForm() {
       description: descInput.value.trim(),
       categoryId: catId,
       tags:   parseTags(tagsInput.value),
-      paidBy: paidBySelect?.value || null,
     });
     amountInput.value = '';
     descInput.value   = '';
     tagsInput.value   = '';
-    if (paidBySelect) paidBySelect.value = '';
     await reload();
   });
 
@@ -869,7 +1115,11 @@ function buildExpenseForm() {
    Lista de movimientos
    ================================================================ */
 
-function buildExpenseList(monthExpenses, activeMonthly, activeAnnual) {
+/** Lista solo gastos REALES (ad-hoc + materializados de recurrente). Las
+ *  proyecciones se muestran en el bloque "Pendiente del mes contable" aparte,
+ *  para que los botones editar/borrar de esta lista solo afecten al gasto
+ *  concreto y nunca a la plantilla del recurrente. */
+function buildExpenseList(monthExpenses) {
   const section = el('div', { class: 'card list-card' });
 
   // Etiquetas únicas del mes para el filtro
@@ -877,7 +1127,7 @@ function buildExpenseList(monthExpenses, activeMonthly, activeAnnual) {
   const hasFilter = !!state.tagFilter;
 
   const header = el('div', { class: 'card-header' });
-  header.appendChild(el('h2', { class: 'card-title', text: 'Movimientos del mes' }));
+  header.appendChild(el('h2', { class: 'card-title', text: 'Gastos del mes' }));
   section.appendChild(header);
 
   if (allTags.length > 0) {
@@ -899,19 +1149,23 @@ function buildExpenseList(monthExpenses, activeMonthly, activeAnnual) {
     section.appendChild(filterRow);
   }
 
-  // Aplicar filtro
   const visibleExpenses = hasFilter
     ? monthExpenses.filter(e => (e.tags || []).includes(state.tagFilter))
     : monthExpenses;
-  const visibleMonthly  = hasFilter ? [] : activeMonthly;
-  const visibleAnnual   = hasFilter ? [] : activeAnnual;
 
-  const allItems = [];
+  if (visibleExpenses.length === 0) {
+    const msg = hasFilter ? `No hay gastos con la etiqueta #${state.tagFilter}` : 'Sin gastos reales este mes';
+    section.appendChild(el('div', { class: 'empty-state', text: msg }));
+    return section;
+  }
 
-  // Gastos puntuales
-  visibleExpenses.forEach(e => {
+  // Orden: por fecha descendente
+  const ordered = [...visibleExpenses].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
+  const list = el('div', { class: 'expense-list' });
+  ordered.forEach(e => {
     const cat = state.categories.find(c => c.id === e.categoryId);
-    allItems.push({
+    const item = {
       id: e.id,
       type: 'expense',
       desc: e.description || cat?.name || 'Gasto',
@@ -922,64 +1176,11 @@ function buildExpenseList(monthExpenses, activeMonthly, activeAnnual) {
       icon: cat?.icon || '',
       amount: e.amountCents,
       date: e.date,
-      badge: null,
       tags:   e.tags   || [],
-      paidBy: e.paidBy || null,
-    });
-  });
+      sourceRecurringId: e.sourceRecurringId || null,
+    };
 
-  // Recurrentes mensuales
-  visibleMonthly.forEach(r => {
-    const cat = state.categories.find(c => c.id === r.categoryId);
-    allItems.push({
-      id: r.id,
-      type: 'recurring',
-      desc: r.name,
-      catName: cat?.name || 'Sin categoría',
-      color: cat?.color || '#999',
-      icon: cat?.icon || '',
-      amount: r.amountCents,
-      date: null,
-      badge: 'Fijo',
-      tags: [], paidBy: null,
-    });
-  });
-
-  // Anualizados
-  visibleAnnual.forEach(r => {
-    const cat = state.categories.find(c => c.id === r.categoryId);
-    allItems.push({
-      id: r.id,
-      type: 'annual',
-      desc: r.name,
-      catName: cat?.name || 'Sin categoría',
-      color: cat?.color || '#999',
-      icon: cat?.icon || '',
-      amount: Math.round(r.amountCents / 12),
-      date: null,
-      badge: 'Anual',
-      fullAmount: r.amountCents,
-      tags: [], paidBy: null,
-    });
-  });
-
-  if (allItems.length === 0) {
-    const msg = hasFilter ? `No hay gastos con la etiqueta #${state.tagFilter}` : 'No hay movimientos este mes';
-    section.appendChild(el('div', { class: 'empty-state', text: msg }));
-    return section;
-  }
-
-  // Ordenar: puntuales por fecha desc, luego fijos, luego anuales
-  allItems.sort((a, b) => {
-    if (a.type === 'expense' && b.type === 'expense') return (b.date || '').localeCompare(a.date || '');
-    const order = { expense: 0, recurring: 1, annual: 2 };
-    return order[a.type] - order[b.type];
-  });
-
-  const list = el('div', { class: 'expense-list' });
-  allItems.forEach(item => {
     const row = el('div', { class: 'expense-row' });
-
     row.appendChild(el('span', { class: 'dot', style: { backgroundColor: item.color } }));
 
     const info = el('div', { class: 'expense-info' });
@@ -987,10 +1188,14 @@ function buildExpenseList(monthExpenses, activeMonthly, activeAnnual) {
     const descSpan = el('span', { class: 'expense-desc' });
     appendIconText(descSpan, item.icon, item.desc, 14);
     topLine.appendChild(descSpan);
-    if (item.badge) {
-      topLine.appendChild(el('span', { class: `badge badge-${item.type}`, text: item.badge }));
+    if (item.sourceRecurringId) {
+      topLine.appendChild(el('span', {
+        class: 'expense-recurring-mark',
+        title: 'Generado a partir de un recurrente',
+        'aria-label': 'Recurrente',
+        html: Icons.svg('repeat', 12),
+      }));
     }
-    // Badges de etiquetas
     if (item.tags && item.tags.length > 0) {
       item.tags.forEach(tag => {
         topLine.appendChild(el('button', {
@@ -1004,49 +1209,23 @@ function buildExpenseList(monthExpenses, activeMonthly, activeAnnual) {
 
     let meta = item.catName;
     if (item.date) meta += ` · ${fmtDate(item.date)}`;
-    if (item.fullAmount) meta += ` · ${fmtEUR(item.fullAmount)}/año`;
-    if (item.paidBy) meta += ` · Pagó ${item.paidBy}`;
     info.appendChild(el('div', { class: 'expense-meta', text: meta }));
     row.appendChild(info);
 
     row.appendChild(el('span', { class: 'expense-amount mono', text: fmtEUR(item.amount) }));
 
-    // Botones editar y eliminar — todos los tipos los llevan para mantener la columna
-    // de importes alineada y dar acceso rápido también a los recurrentes/anualizados.
-    if (item.type === 'expense') {
-      row.appendChild(el('button', {
-        class: 'btn-edit', html: Icons.svg('edit', 14), title: 'Editar',
-        onClick: () => openInlineEdit(item, row),
-      }));
-      row.appendChild(el('button', {
-        class: 'btn-delete', html: Icons.svg('close', 14), title: 'Eliminar',
-        onClick: async () => {
-          if (!confirm('¿Eliminar este gasto?')) return;
-          await DB.deleteExpense(item.id);
-          await reload();
-        },
-      }));
-    } else {
-      // recurring / annual → editar abre el modal de recurrentes; eliminar borra con confirmación
-      const recId = item.id;
-      row.appendChild(el('button', {
-        class: 'btn-edit', html: Icons.svg('edit', 14), title: 'Editar recurrente',
-        onClick: () => {
-          const r = state.recurring.find(x => x.id === recId);
-          if (r) openRecurringEdit(r);
-        },
-      }));
-      row.appendChild(el('button', {
-        class: 'btn-delete', html: Icons.svg('close', 14), title: 'Eliminar recurrente',
-        onClick: async () => {
-          const r = state.recurring.find(x => x.id === recId);
-          if (!r) return;
-          if (!confirm(`¿Eliminar el recurrente "${r.name}"?`)) return;
-          await DB.deleteRecurring(recId);
-          await reload();
-        },
-      }));
-    }
+    row.appendChild(el('button', {
+      class: 'btn-edit', html: Icons.svg('edit', 14), title: 'Editar',
+      onClick: () => openInlineEdit(item, row),
+    }));
+    row.appendChild(el('button', {
+      class: 'btn-delete', html: Icons.svg('close', 14), title: 'Eliminar',
+      onClick: async () => {
+        if (!confirm('¿Eliminar este gasto?')) return;
+        await DB.deleteExpense(item.id);
+        await reload();
+      },
+    }));
 
     list.appendChild(row);
   });
@@ -1095,34 +1274,26 @@ function openInlineEdit(item, row) {
     style: { minWidth: '110px' },
   });
 
-  let paidBySel = null;
-  if (state.people.length >= 2) {
-    paidBySel = el('select', { class: 'form-input', style: { minWidth: '110px' } });
-    paidBySel.appendChild(el('option', { value: '', text: 'Personal' }));
-    state.people.forEach(p => {
-      const opt = el('option', { value: p, text: p });
-      if (item.paidBy === p) opt.selected = true;
-      paidBySel.appendChild(opt);
-    });
-  }
-
   const fields = el('div', { class: 'edit-row-fields' });
   [amtInput, catSelect, dateInput, descInput, tagsInlineInput].forEach(f => fields.appendChild(f));
-  if (paidBySel) fields.appendChild(paidBySel);
   row.appendChild(fields);
 
   async function save() {
     const cents = eurToCents(amtInput.value);
     const catId = parseInt(catSelect.value);
     if (!cents || !catId) return;
+    // Spread del original para preservar campos no editables aquí (sourceRecurringId,
+    // recurringInstanceKey…). Sin esto, un gasto materializado perdería su vínculo y
+    // se rematerializaría en el siguiente boot → duplicado.
+    const original = state.expenses.find(x => x.id === item.id) || {};
     await DB.updateExpense({
+      ...original,
       id: item.id,
       date: dateInput.value || today(),
       amountCents: cents,
       description: descInput.value.trim(),
       categoryId: catId,
       tags:   parseTags(tagsInlineInput.value),
-      paidBy: paidBySel?.value || null,
     });
     await reload();
   }
@@ -1141,6 +1312,222 @@ function openInlineEdit(item, row) {
 
   amtInput.focus();
   amtInput.select();
+}
+
+/* ================================================================
+   Frequency radio — selector de frecuencia para recurrentes
+   ================================================================ */
+
+/** 3 radios: Mensual (default), Anual, Anualizado. Expone getValue/setValue/onChange. */
+function buildFrequencyRadios(initial = 'monthly') {
+  const valid = ['monthly', 'annual', 'annualized'];
+  let selected = valid.includes(initial) ? initial : 'monthly';
+  const listeners = [];
+  const radios = {};
+
+  const root = el('div', { class: 'freq-radios' });
+
+  const options = [
+    { value: 'monthly',    label: 'Mensual',    hint: 'Cada mes en el día indicado' },
+    { value: 'annual',     label: 'Anual',      hint: 'Una vez al año en una fecha concreta' },
+    { value: 'annualized', label: 'Anualizado', hint: 'Pago anual repartido /12 cada mes' },
+  ];
+
+  // Nombre único por instancia para no entrar en conflicto con otros forms en pantalla.
+  const groupName = 'freq-' + Math.random().toString(36).slice(2, 8);
+
+  options.forEach((opt) => {
+    const wrap = el('label', { class: 'freq-radio' });
+    const radio = el('input', { type: 'radio', name: groupName, value: opt.value });
+    if (opt.value === selected) radio.checked = true;
+    radio.addEventListener('change', () => {
+      if (radio.checked) {
+        selected = opt.value;
+        listeners.forEach((fn) => fn(selected));
+      }
+    });
+    wrap.appendChild(radio);
+    const txt = el('span', { class: 'freq-radio-text' });
+    txt.appendChild(el('span', { class: 'freq-radio-label', text: opt.label }));
+    txt.appendChild(el('span', { class: 'freq-radio-hint',  text: opt.hint }));
+    wrap.appendChild(txt);
+    root.appendChild(wrap);
+    radios[opt.value] = radio;
+  });
+
+  return {
+    element: root,
+    getValue: () => selected,
+    setValue: (v) => {
+      if (!radios[v]) return;
+      radios[v].checked = true;
+      selected = v;
+    },
+    onChange: (fn) => listeners.push(fn),
+  };
+}
+
+/* ================================================================
+   Day picker — selector de día (1-31) y opcionalmente mes (1-12)
+   ================================================================ */
+
+/** Selector de día del mes con modo opcional "día + mes" para recurrentes anuales.
+ *  Opciones:
+ *    - day            : día inicial (1-31)
+ *    - month          : mes inicial (1-12), solo si includeMonth=true
+ *    - includeMonth   : si true, muestra grid de meses y getValue devuelve {day, month}
+ *  Devuelve { element, getValue, setValue, setIncludeMonth, isValid }. */
+function buildDayPicker(options = {}) {
+  const maxDay = (options.maxDay && options.maxDay >= 1 && options.maxDay <= 31) ? options.maxDay : 31;
+  let selectedDay   = (options.day   != null && options.day   >= 1 && options.day   <= maxDay) ? options.day   : null;
+  let selectedMonth = (options.month != null && options.month >= 1 && options.month <= 12)     ? options.month : null;
+  let includeMonth  = !!options.includeMonth;
+  let outsideHandler = null;
+  // Etiqueta del trigger: 'monthly' = "Día N de cada mes"; 'startDay' = "Empieza el día N".
+  const triggerVariant = options.triggerVariant || 'monthly';
+  const noteText = options.note || 'En meses sin ese día (29/30/31), el cobro se aplicará el último día disponible.';
+
+  const root    = el('div', { class: 'day-picker' });
+  const trigger = el('button', { type: 'button', class: 'form-input day-picker-trigger' });
+  const popover = el('div', { class: 'day-picker-popover hidden' });
+
+  // --- Day section ---
+  const daySection = el('div', { class: 'day-picker-section' });
+  daySection.appendChild(el('p', { class: 'day-picker-section-label', text: 'Día' }));
+  const dayGrid = el('div', { class: 'day-picker-grid' });
+  for (let d = 1; d <= maxDay; d++) {
+    const cell = el('button', { type: 'button', class: 'day-picker-cell', text: String(d) });
+    cell.dataset.day = d;
+    cell.addEventListener('click', () => {
+      selectedDay = d;
+      refreshDayCells();
+      refreshTrigger();
+      // Cierra si día-only, o si en modo día+mes ya hay mes elegido.
+      if (!includeMonth || selectedMonth != null) closePopover();
+    });
+    dayGrid.appendChild(cell);
+  }
+  daySection.appendChild(dayGrid);
+
+  // --- Month section (oculto por defecto, visible si includeMonth) ---
+  const monthSection = el('div', { class: 'day-picker-section month-section' });
+  monthSection.appendChild(el('p', { class: 'day-picker-section-label', text: 'Mes' }));
+  const monthGrid = el('div', { class: 'month-picker-grid' });
+  const monthShortNames = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
+  for (let m = 1; m <= 12; m++) {
+    const cell = el('button', { type: 'button', class: 'month-picker-cell', text: monthShortNames[m - 1] });
+    cell.dataset.month = m;
+    cell.addEventListener('click', () => {
+      selectedMonth = m;
+      refreshMonthCells();
+      refreshTrigger();
+      if (selectedDay != null) closePopover();
+    });
+    monthGrid.appendChild(cell);
+  }
+  monthSection.appendChild(monthGrid);
+
+  const note = el('p', { class: 'day-picker-note', text: noteText });
+
+  popover.appendChild(daySection);
+  popover.appendChild(monthSection);
+  popover.appendChild(note);
+  root.appendChild(trigger);
+  root.appendChild(popover);
+
+  function refreshTrigger() {
+    if (selectedDay == null) {
+      trigger.textContent = includeMonth ? '— Selecciona fecha —' : '— Selecciona día —';
+      trigger.classList.remove('has-value');
+      return;
+    }
+    if (includeMonth) {
+      if (selectedMonth == null) {
+        trigger.textContent = `Día ${selectedDay} — falta mes`;
+        trigger.classList.remove('has-value');
+        return;
+      }
+      trigger.textContent = `${selectedDay} de ${monthShortNames[selectedMonth - 1].toLowerCase()} (cada año)`;
+      trigger.classList.add('has-value');
+    } else if (triggerVariant === 'startDay') {
+      trigger.textContent = `Empieza el día ${selectedDay} del mes anterior`;
+      trigger.classList.add('has-value');
+    } else {
+      trigger.textContent = `Día ${selectedDay} de cada mes`;
+      trigger.classList.add('has-value');
+    }
+  }
+
+  function refreshDayCells() {
+    dayGrid.querySelectorAll('.day-picker-cell').forEach((c) => {
+      c.classList.toggle('selected', parseInt(c.dataset.day, 10) === selectedDay);
+    });
+  }
+
+  function refreshMonthCells() {
+    monthGrid.querySelectorAll('.month-picker-cell').forEach((c) => {
+      c.classList.toggle('selected', parseInt(c.dataset.month, 10) === selectedMonth);
+    });
+  }
+
+  function applyIncludeMonth() {
+    monthSection.classList.toggle('hidden', !includeMonth);
+    refreshTrigger();
+  }
+
+  function closePopover() {
+    popover.classList.add('hidden');
+    if (outsideHandler) {
+      document.removeEventListener('click', outsideHandler);
+      outsideHandler = null;
+    }
+  }
+
+  function openPopover() {
+    popover.classList.remove('hidden');
+    setTimeout(() => {
+      outsideHandler = (e) => { if (!root.contains(e.target)) closePopover(); };
+      document.addEventListener('click', outsideHandler);
+    }, 0);
+  }
+
+  trigger.addEventListener('click', (e) => {
+    e.stopPropagation();
+    popover.classList.contains('hidden') ? openPopover() : closePopover();
+  });
+
+  applyIncludeMonth();
+  refreshDayCells();
+  refreshMonthCells();
+  refreshTrigger();
+
+  return {
+    element: root,
+    getValue: () => includeMonth ? { day: selectedDay, month: selectedMonth } : selectedDay,
+    setValue: (val) => {
+      if (val == null) {
+        selectedDay = null;
+        selectedMonth = null;
+      } else if (typeof val === 'object') {
+        selectedDay   = (val.day   >= 1 && val.day   <= 31) ? val.day   : null;
+        selectedMonth = (val.month >= 1 && val.month <= 12) ? val.month : null;
+      } else {
+        selectedDay = (val >= 1 && val <= 31) ? val : null;
+      }
+      refreshDayCells();
+      refreshMonthCells();
+      refreshTrigger();
+    },
+    setIncludeMonth: (flag) => {
+      includeMonth = !!flag;
+      applyIncludeMonth();
+    },
+    isValid: () => {
+      if (selectedDay == null) return false;
+      if (includeMonth && selectedMonth == null) return false;
+      return true;
+    },
+  };
 }
 
 /* ================================================================
@@ -1172,24 +1559,34 @@ function renderRecurring(container) {
   state.categories.forEach(c => {
     catSelect.appendChild(el('option', { value: c.id, text: c.name }));
   });
-  // Categoría a ancho completo para que "Desde" y "Hasta" puedan compartir fila debajo.
+  // Categoría a ancho completo.
   const catGroup = wrap('Categoría', catSelect);
   catGroup.classList.add('full-width');
   form.appendChild(catGroup);
 
-  // Rango de vigencia (mes de inicio obligatorio, fin opcional) — comparten la misma fila
+  // Tipo (frecuencia) — radio con 3 opciones. Por defecto 'monthly'.
+  const freqRadios = buildFrequencyRadios('monthly');
+  const freqGroup = el('div', { class: 'form-group full-width' });
+  freqGroup.appendChild(el('label', { class: 'form-label', text: 'Tipo' }));
+  freqGroup.appendChild(freqRadios.element);
+  form.appendChild(freqGroup);
+
+  // Día de cobro (obligatorio) — el picker amplía a día+mes cuando freq=annual.
+  const dayPicker = buildDayPicker({ includeMonth: false });
+  const dayGroup = wrap('Día de cobro', dayPicker.element);
+  dayGroup.classList.add('full-width');
+  form.appendChild(dayGroup);
+
+  freqRadios.onChange((freq) => {
+    dayPicker.setIncludeMonth(freq === 'annual');
+  });
+
+  // Rango de vigencia (mes de inicio obligatorio, fin opcional)
   const defaultStart = ymKey(state.year, state.month);
   const startInput = el('input', { type: 'month', class: 'form-input', id: 'rec-start', value: defaultStart });
   form.appendChild(wrap('Desde (mes)', startInput));
   const endInput = el('input', { type: 'month', class: 'form-input', id: 'rec-end' });
   form.appendChild(wrap('Hasta (opcional)', endInput));
-
-  const annualChk = el('input', { type: 'checkbox', id: 'rec-annual' });
-  const annualLabel = el('label', { class: 'check-label', html: ' Gasto anualizado <small>(se prorratea /12 cada mes)</small>' });
-  annualLabel.prepend(annualChk);
-  const checkWrap = el('div', { class: 'form-group full-width' });
-  checkWrap.appendChild(annualLabel);
-  form.appendChild(checkWrap);
 
   form.appendChild(el('button', { type: 'submit', class: 'btn btn-primary', text: 'Añadir recurrente' }));
 
@@ -1198,26 +1595,34 @@ function renderRecurring(container) {
     const cents = eurToCents(amtInput.value);
     const catId = parseInt(catSelect.value);
     if (!nameInput.value.trim() || !cents || !catId) return;
+    if (!dayPicker.isValid()) {
+      alert('Selecciona la fecha de cobro');
+      return;
+    }
     const startMonth = startInput.value || currentYmKey();
     const endMonth   = endInput.value || null;
     if (endMonth && endMonth < startMonth) {
       alert('La fecha "Hasta" no puede ser anterior a "Desde"');
       return;
     }
+    const freq = freqRadios.getValue();
+    const dayVal = dayPicker.getValue();
+    const paymentDay   = (typeof dayVal === 'object') ? dayVal.day   : dayVal;
+    const paymentMonth = (typeof dayVal === 'object') ? dayVal.month : null;
     await DB.addRecurring({
       name: nameInput.value.trim(),
       amountCents: cents,
       categoryId: catId,
-      annual: annualChk.checked,
+      frequency: freq,
       active: true,
       startMonth,
       endMonth,
+      paymentDay,
+      paymentMonth,
     });
-    nameInput.value = '';
-    amtInput.value = '';
-    annualChk.checked = false;
-    endInput.value = '';
-    startInput.value = ymKey(state.year, state.month);
+    // No limpiamos inputs: reload() reconstruye el form. Materializamos antes
+    // del reload para que la fila aparezca ya con el gasto del mes en curso.
+    await materializeRecurrings();
     await reload();
   });
 
@@ -1266,41 +1671,70 @@ function buildRecurringRow(r) {
   }
   info.appendChild(descLine);
 
-  // Línea de detalles: importe + rango
-  const metaParts = [];
-  metaParts.push(cat?.name || 'Sin categoría');
-  metaParts.push(r.annual
-    ? `${fmtEUR(r.amountCents)}/año → ${fmtEUR(Math.round(r.amountCents / 12))}/mes`
-    : 'mensual');
-  if (r.startMonth || r.endMonth) {
-    if (r.startMonth && r.endMonth) {
-      metaParts.push(`${fmtYearMonth(r.startMonth)} — ${fmtYearMonth(r.endMonth)}`);
-    } else if (r.startMonth) {
-      metaParts.push(`desde ${fmtYearMonth(r.startMonth)}`);
-    } else if (r.endMonth) {
-      metaParts.push(`hasta ${fmtYearMonth(r.endMonth)}`);
+  // Meta: categoría · periodicidad · día/fecha de cobro
+  const freq = getFrequency(r);
+  const monthShortNames = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+  let freqLabel = 'mensual';
+  let dayLabel = '';
+  if (freq === 'annualized') {
+    freqLabel = 'anualizado';
+    if (r.paymentDay) dayLabel = `día ${r.paymentDay}`;
+  } else if (freq === 'annual') {
+    freqLabel = 'anual';
+    if (r.paymentDay && r.paymentMonth) {
+      dayLabel = `${r.paymentDay} ${monthShortNames[r.paymentMonth - 1]}`;
     }
+  } else {
+    if (r.paymentDay) dayLabel = `día ${r.paymentDay}`;
   }
+  const metaParts = [cat?.name || 'Sin categoría', freqLabel];
+  if (dayLabel) metaParts.push(dayLabel);
   info.appendChild(el('div', { class: 'expense-meta', text: metaParts.join(' · ') }));
+
+  // Rango de fechas en su propia línea (cuando aplique)
+  let rangeText = '';
+  if (r.startMonth && r.endMonth) {
+    rangeText = `${fmtYearMonth(r.startMonth)} — ${fmtYearMonth(r.endMonth)}`;
+  } else if (r.startMonth) {
+    rangeText = `desde ${fmtYearMonth(r.startMonth)}`;
+  } else if (r.endMonth) {
+    rangeText = `hasta ${fmtYearMonth(r.endMonth)}`;
+  }
+  if (rangeText) {
+    info.appendChild(el('div', { class: 'expense-meta recurring-range', text: rangeText }));
+  }
   row.appendChild(info);
 
-  row.appendChild(el('span', {
-    class: 'expense-amount mono',
-    text: r.annual ? fmtEUR(Math.round(r.amountCents / 12)) + '/mes' : fmtEUR(r.amountCents),
-  }));
+  let amountText;
+  if (freq === 'annualized') {
+    amountText = `${fmtEUR(r.amountCents)}/año → ${fmtEUR(Math.round(r.amountCents / 12))}/mes`;
+  } else if (freq === 'annual') {
+    amountText = `${fmtEUR(r.amountCents)}/año`;
+  } else {
+    amountText = `${fmtEUR(r.amountCents)}/mes`;
+  }
+  row.appendChild(el('span', { class: 'expense-amount mono', text: amountText }));
+
+  const toggleBtn = el('button', {
+    class: 'btn-edit btn-toggle',
+    title: r.active ? 'Pausar' : 'Activar',
+    'aria-label': r.active ? 'Pausar recurrente' : 'Activar recurrente',
+    html: Icons.svg(r.active ? 'pause' : 'play', 14),
+    onClick: async () => {
+      const next = !r.active;
+      await DB.updateRecurring({ ...r, active: next });
+      // Si se reactiva y el día ya pasó este mes, materializar al instante.
+      if (next) await materializeRecurrings();
+      await reload();
+    },
+  });
+  row.appendChild(toggleBtn);
 
   const editBtn = el('button', {
     class: 'btn-edit', html: Icons.svg('edit', 14),
     onClick: () => openRecurringEdit(r),
   });
   row.appendChild(editBtn);
-
-  const toggleBtn = el('button', {
-    class: 'btn btn-ghost btn-sm',
-    text: r.active ? 'Pausar' : 'Activar',
-    onClick: async () => { await DB.updateRecurring({ ...r, active: !r.active }); await reload(); },
-  });
-  row.appendChild(toggleBtn);
 
   const delBtn = el('button', {
     class: 'btn-delete', html: Icons.svg('close', 14),
@@ -1339,19 +1773,33 @@ function openRecurringEdit(r) {
     catGroup.classList.add('full-width');
     form.appendChild(catGroup);
 
+    // Tipo (frecuencia) — radio justo después de categoría.
+    const initialFreq = getFrequency(r);
+    const freqRadios = buildFrequencyRadios(initialFreq);
+    const freqGroup = el('div', { class: 'form-group full-width' });
+    freqGroup.appendChild(el('label', { class: 'form-label', text: 'Tipo' }));
+    freqGroup.appendChild(freqRadios.element);
+    form.appendChild(freqGroup);
+
+    // Día de cobro — picker dinámico según frecuencia.
+    const dayPicker = buildDayPicker({
+      day: r.paymentDay || null,
+      month: r.paymentMonth || null,
+      includeMonth: initialFreq === 'annual',
+    });
+    const dayGroup = wrap('Día de cobro', dayPicker.element);
+    dayGroup.classList.add('full-width');
+    form.appendChild(dayGroup);
+
+    freqRadios.onChange((freq) => {
+      dayPicker.setIncludeMonth(freq === 'annual');
+    });
+
     const startInput = el('input', { type: 'month', class: 'form-input', value: r.startMonth || '' });
     form.appendChild(wrap('Desde (mes)', startInput));
 
     const endInput = el('input', { type: 'month', class: 'form-input', value: r.endMonth || '' });
     form.appendChild(wrap('Hasta (opcional)', endInput));
-
-    const annualChk = el('input', { type: 'checkbox' });
-    annualChk.checked = !!r.annual;
-    const annualLabel = el('label', { class: 'check-label', html: ' Gasto anualizado <small>(se prorratea /12 cada mes)</small>' });
-    annualLabel.prepend(annualChk);
-    const checkWrap = el('div', { class: 'form-group full-width' });
-    checkWrap.appendChild(annualLabel);
-    form.appendChild(checkWrap);
 
     const actions = el('div', { class: 'form-group full-width', style: { display: 'flex', gap: '10px' } });
     const saveBtn = el('button', { type: 'submit', class: 'btn btn-primary', text: 'Guardar' });
@@ -1365,22 +1813,36 @@ function openRecurringEdit(r) {
       const cents = eurToCents(amtInput.value);
       const catId = parseInt(catSelect.value);
       if (!nameInput.value.trim() || !cents || !catId) return;
+      if (!dayPicker.isValid()) {
+        alert('Selecciona la fecha de cobro');
+        return;
+      }
       const startMonth = startInput.value || null;
       const endMonth   = endInput.value   || null;
       if (startMonth && endMonth && endMonth < startMonth) {
         alert('La fecha "Hasta" no puede ser anterior a "Desde"');
         return;
       }
+      const freq = freqRadios.getValue();
+      const dayVal = dayPicker.getValue();
+      const paymentDay   = (typeof dayVal === 'object') ? dayVal.day   : dayVal;
+      const paymentMonth = (typeof dayVal === 'object') ? dayVal.month : null;
+      // Limpiamos el bool annual legacy para que getFrequency lea siempre el campo nuevo.
+      const { annual, ...rest } = r;
       await DB.updateRecurring({
-        ...r,
+        ...rest,
         name: nameInput.value.trim(),
         amountCents: cents,
         categoryId: catId,
-        annual: annualChk.checked,
+        frequency: freq,
         startMonth,
         endMonth,
+        paymentDay,
+        paymentMonth,
       });
       closeModal();
+      // Si el nuevo día ya pasó (en cualquier mes de la ventana de lookback), materializar.
+      await materializeRecurrings();
       await reload();
     });
 
@@ -1543,6 +2005,111 @@ function wrap(labelText, input) {
    Vista: Categorías
    ================================================================ */
 
+/* ================================================================
+   Vista: Mes contable (configuración del payrollDay)
+   ================================================================ */
+
+function renderAccountingMonth(container) {
+  const card = el('div', { class: 'card' });
+  card.style.maxWidth = '640px';
+  card.style.margin = '0 auto';
+
+  card.appendChild(el('h2', { class: 'card-title', text: 'Mes contable' }));
+  card.appendChild(el('p', {
+    class: 'expense-meta',
+    style: { margin: '6px 0 4px' },
+    text: 'Define el día en que empieza tu mes contable. Útil si cobras un día concreto del mes y quieres que tu ahorro empiece a contar desde ese día. Afecta a Gastos, Ahorro e Informes; el Calendario sigue mostrando el mes natural.',
+  }));
+  card.appendChild(el('p', {
+    class: 'expense-meta',
+    style: { margin: '4px 0 18px' },
+    text: 'Convención bancaria: cada periodo se nombra por el mes en que TERMINA. Ej: con día 25, "Mayo" abarca del 25-abril al 24-mayo.',
+  }));
+
+  const dayPicker = buildDayPicker({
+    day: state.payrollDay || 1,
+    maxDay: 28,
+    triggerVariant: 'startDay',
+    note: 'Limitado a 1-28 para que todos los periodos sean uniformes (febrero solo tiene 28 días). El día 1 equivale al mes natural.',
+  });
+
+  const dayGroup = el('div', { class: 'form-group full-width' });
+  dayGroup.appendChild(el('label', { class: 'form-label', text: 'Inicio del mes contable' }));
+  dayGroup.appendChild(dayPicker.element);
+  card.appendChild(dayGroup);
+
+  // Preview en vivo del periodo actual y siguientes 2 meses contables.
+  const previewBox = el('div', { class: 'accounting-preview' });
+  card.appendChild(previewBox);
+
+  function refreshPreview() {
+    clear(previewBox);
+    const day = dayPicker.getValue() || 1;
+    previewBox.appendChild(el('p', { class: 'form-label', text: 'Vista previa' }));
+    const list = el('div', { class: 'accounting-preview-list' });
+    // Tomamos el mes contable que contiene HOY como referencia.
+    const today = new Date();
+    const iso = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+    const refYm = accountingMonth(iso, day);
+    let [refY, refM] = refYm.split('-').map(n => parseInt(n, 10));
+    for (let i = 0; i < 3; i++) {
+      const [s, e] = monthBounds(refY, refM, day);
+      const row = el('div', { class: 'accounting-preview-row' });
+      row.appendChild(el('span', { class: 'accounting-preview-label', text: `${monthName(refM)} ${refY}` }));
+      row.appendChild(el('span', { class: 'accounting-preview-range mono', text: `${fmtPreviewDate(s)} → ${fmtPreviewDate(e)}` }));
+      list.appendChild(row);
+      // siguiente mes contable
+      refM++;
+      if (refM > 12) { refM = 1; refY++; }
+    }
+    previewBox.appendChild(list);
+  }
+
+  // Wrap el picker para detectar cambios. Como el picker no expone onChange,
+  // engancho un MutationObserver al trigger (su textContent cambia cuando hay selección).
+  const obs = new MutationObserver(refreshPreview);
+  obs.observe(dayPicker.element.querySelector('.day-picker-trigger'), { childList: true, characterData: true, subtree: true });
+  refreshPreview();
+
+  // Botones acción
+  const actions = el('div', { class: 'form-group full-width', style: { display: 'flex', gap: '10px', marginTop: '12px' } });
+  const saveBtn = el('button', {
+    class: 'btn btn-primary', text: 'Guardar',
+    onClick: async () => {
+      const day = dayPicker.getValue() || 1;
+      await DB.setSetting('payroll-day', day);
+      state.payrollDay = day;
+      saveBtn.textContent = '✓ Guardado';
+      setTimeout(() => { saveBtn.textContent = 'Guardar'; }, 1400);
+      await reload();
+    },
+  });
+  const resetBtn = el('button', {
+    class: 'btn btn-ghost', text: 'Restablecer a día 1 (mes natural)',
+    onClick: async () => {
+      dayPicker.setValue(1);
+      await DB.setSetting('payroll-day', 1);
+      state.payrollDay = 1;
+      await reload();
+    },
+  });
+  actions.appendChild(saveBtn);
+  actions.appendChild(resetBtn);
+  card.appendChild(actions);
+
+  container.appendChild(card);
+}
+
+/** Formatea 'YYYY-MM-DD' como '25-abr-2026' para la preview. */
+function fmtPreviewDate(iso) {
+  if (!iso) return '';
+  const monthShort = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+  const y = iso.slice(0, 4);
+  const m = parseInt(iso.slice(5, 7), 10);
+  const d = iso.slice(8, 10);
+  return `${d}-${monthShort[m - 1]}-${y}`;
+}
+
 function renderCategories(container) {
   const card = el('div', { class: 'card' });
   card.style.maxWidth = '600px';
@@ -1550,58 +2117,14 @@ function renderCategories(container) {
 
   card.appendChild(el('h2', { class: 'card-title', text: 'Gestionar categorías' }));
 
-  // Form nueva categoría
-  const form = el('form', { class: 'category-form' });
-  const topRow = el('div', { class: 'category-form-row' });
-  const colorInp = el('input', { type: 'color', value: '#c47a1a', class: 'color-input' });
-  const nameInp = el('input', { class: 'form-input', placeholder: 'Nombre de la categoría', style: { flex: '1' } });
-  const addBtn = el('button', { type: 'submit', class: 'btn btn-primary', text: 'Añadir' });
-  topRow.appendChild(colorInp);
-  topRow.appendChild(nameInp);
-  topRow.appendChild(addBtn);
-  form.appendChild(topRow);
-
-  // Límite mensual (opcional)
-  const limitInp = el('input', {
-    type: 'text', inputmode: 'decimal',
-    class: 'form-input mono', placeholder: 'Sin límite',
-    style: { maxWidth: '160px' },
+  // Botón "+ Nueva categoría" — abre modal con preview vivo y form completo.
+  const addBtn = el('button', {
+    type: 'button',
+    class: 'btn btn-primary category-add-btn',
+    onClick: () => openCategoryModal(null),
   });
-  const limitRow = el('div', { class: 'category-limit-row' },
-    el('label', { class: 'form-label', text: 'Límite mensual (€)' }),
-    limitInp,
-  );
-  form.appendChild(limitRow);
-
-  // Selector visual de iconos
-  form.appendChild(el('div', {
-    class: 'form-label',
-    text: 'Icono',
-    style: { marginTop: '14px', marginBottom: '8px' },
-  }));
-  const picker = buildIconPicker(null);
-  form.appendChild(picker);
-
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    if (!nameInp.value.trim()) return;
-    const limitCents = limitInp.value.trim() ? eurToCents(limitInp.value) : 0;
-    await DB.addCategory({
-      name: nameInp.value.trim(),
-      color: colorInp.value,
-      icon: picker.dataset.value || '',
-      monthlyLimitCents: limitCents,
-    });
-    nameInp.value = '';
-    limitInp.value = '';
-    picker.querySelectorAll('.icon-pick-item').forEach(b => b.classList.remove('selected'));
-    picker.dataset.value = '';
-    await reload();
-  });
-  card.appendChild(form);
-
-  const divider = el('hr', { class: 'divider' });
-  card.appendChild(divider);
+  addBtn.innerHTML = `${Icons.svg('plus', 14)} <span>Nueva categoría</span>`;
+  card.appendChild(addBtn);
 
   // Lista
   const list = el('div', { class: 'category-list' });
@@ -1625,7 +2148,7 @@ function renderCategories(container) {
     }
     row.appendChild(el('button', {
       class: 'btn-edit', html: Icons.svg('edit', 14), title: 'Editar',
-      onClick: () => openCategoryEdit(c, row),
+      onClick: () => openCategoryModal(c),
     }));
     row.appendChild(el('button', {
       class: 'btn-delete', html: Icons.svg('close', 14), title: 'Eliminar',
@@ -1640,8 +2163,129 @@ function renderCategories(container) {
   card.appendChild(list);
 
   container.appendChild(card);
-  container.appendChild(buildPeopleCard());
-  container.appendChild(buildImportExportCard());
+}
+
+/** Modal de creación/edición de categoría. Si `cat` es null → modo creación. */
+function openCategoryModal(cat) {
+  const isEdit = !!cat;
+  const initial = cat || { name: '', color: '#c47a1a', icon: '', monthlyLimitCents: 0 };
+
+  openModal(isEdit ? `Editar "${cat.name}"` : 'Nueva categoría', (body) => {
+    // ---- Preview chip (live) ----
+    const preview = el('div', { class: 'category-preview' });
+    const previewDot  = el('span', { class: 'dot-lg', style: { backgroundColor: initial.color } });
+    const previewIcon = el('span', { class: 'category-icon' });
+    if (Icons.has(initial.icon)) previewIcon.innerHTML = Icons.svg(initial.icon, 18);
+    const previewName = el('span', {
+      class: 'category-preview-name',
+      text: initial.name || 'Nombre de la categoría',
+    });
+    const previewLimit = el('span', { class: 'category-preview-limit mono' });
+    if (initial.monthlyLimitCents > 0) {
+      previewLimit.textContent = `${fmtEUR(initial.monthlyLimitCents)} /mes`;
+    }
+    preview.appendChild(previewDot);
+    preview.appendChild(previewIcon);
+    preview.appendChild(previewName);
+    preview.appendChild(previewLimit);
+    body.appendChild(preview);
+
+    // ---- Form ----
+    const form = el('form', { class: 'category-modal-form' });
+
+    // Nombre (full)
+    const nameGroup = el('div', { class: 'form-group full-width' });
+    nameGroup.appendChild(el('label', { class: 'form-label', text: 'Nombre' }));
+    const nameInp = el('input', { class: 'form-input', value: initial.name, placeholder: 'Ej. Comida' });
+    nameGroup.appendChild(nameInp);
+    form.appendChild(nameGroup);
+
+    // Color
+    const colorGroup = el('div', { class: 'form-group' });
+    colorGroup.appendChild(el('label', { class: 'form-label', text: 'Color' }));
+    const colorInp = el('input', { type: 'color', value: initial.color, class: 'color-input' });
+    colorGroup.appendChild(colorInp);
+    form.appendChild(colorGroup);
+
+    // Límite mensual
+    const limitGroup = el('div', { class: 'form-group' });
+    limitGroup.appendChild(el('label', { class: 'form-label', text: 'Límite mensual (€)' }));
+    const limitInp = el('input', {
+      type: 'text', inputmode: 'decimal',
+      class: 'form-input mono',
+      value: initial.monthlyLimitCents > 0
+        ? (initial.monthlyLimitCents / 100).toFixed(2).replace('.', ',')
+        : '',
+      placeholder: 'Sin límite',
+    });
+    limitGroup.appendChild(limitInp);
+    form.appendChild(limitGroup);
+
+    // Icono (full)
+    const iconGroup = el('div', { class: 'form-group full-width' });
+    iconGroup.appendChild(el('label', { class: 'form-label', text: 'Icono' }));
+    const picker = buildIconPicker(Icons.resolve(initial.icon));
+    iconGroup.appendChild(picker);
+    form.appendChild(iconGroup);
+
+    // Acciones
+    const actions = el('div', {
+      class: 'form-group full-width',
+      style: { display: 'flex', gap: '10px', marginTop: '4px' },
+    });
+    const saveBtn = el('button', {
+      type: 'submit',
+      class: 'btn btn-primary',
+      text: isEdit ? 'Guardar' : 'Añadir',
+    });
+    const cancelBtn = el('button', {
+      type: 'button',
+      class: 'btn btn-ghost',
+      text: 'Cancelar',
+      onClick: closeModal,
+    });
+    actions.appendChild(saveBtn);
+    actions.appendChild(cancelBtn);
+    form.appendChild(actions);
+
+    // ---- Live preview wiring ----
+    function refreshPreview() {
+      previewDot.style.backgroundColor = colorInp.value;
+      previewName.textContent = nameInp.value.trim() || 'Nombre de la categoría';
+      const iconId = picker.dataset.value || '';
+      previewIcon.innerHTML = Icons.has(iconId) ? Icons.svg(iconId, 18) : '';
+      const raw = limitInp.value.trim();
+      previewLimit.textContent = raw ? `${fmtEUR(eurToCents(raw))} /mes` : '';
+    }
+    nameInp.addEventListener('input', refreshPreview);
+    colorInp.addEventListener('input', refreshPreview);
+    limitInp.addEventListener('input', refreshPreview);
+    picker.querySelectorAll('.icon-pick-item').forEach(btn => {
+      btn.addEventListener('click', refreshPreview);
+    });
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!nameInp.value.trim()) return;
+      const limitCents = limitInp.value.trim() ? eurToCents(limitInp.value) : 0;
+      const payload = {
+        name: nameInp.value.trim(),
+        color: colorInp.value,
+        icon: picker.dataset.value || '',
+        monthlyLimitCents: limitCents,
+      };
+      if (isEdit) {
+        await DB.updateCategory({ ...cat, ...payload });
+      } else {
+        await DB.addCategory(payload);
+      }
+      closeModal();
+      await reload();
+    });
+
+    body.appendChild(form);
+    setTimeout(() => nameInp.focus(), 50);
+  });
 }
 
 /* ================================================================
@@ -1907,9 +2551,21 @@ function renderSavings(container) {
     ? Math.min(100, Math.max(0, (yearSavings / state.annualGoal) * 100))
     : 0;
 
-  const title = el('h2', { class: 'card-title', style: { marginBottom: '24px' } });
+  const title = el('h2', { class: 'card-title', style: { marginBottom: '8px' } });
   title.innerHTML = `Ahorro &mdash; ${monthName(state.month)} ${state.year}`;
   container.appendChild(title);
+
+  // Indicador del rango del mes contable (solo cuando difiere del mes natural).
+  if ((state.payrollDay || 1) > 1) {
+    const [s, e] = monthBounds(state.year, state.month, state.payrollDay);
+    container.appendChild(el('p', {
+      class: 'expense-meta',
+      style: { marginBottom: '20px' },
+      text: `Periodo contable: ${fmtPreviewDate(s)} → ${fmtPreviewDate(e)}`,
+    }));
+  } else {
+    container.appendChild(el('div', { style: { marginBottom: '16px' } }));
+  }
 
   const grid = el('div', { class: 'savings-wrap' });
 
@@ -1946,11 +2602,11 @@ function renderSavings(container) {
     return item;
   }
 
-  statsGrid.appendChild(savStat('Gasto total', fmtEUR(monthExpenses)));
+  statsGrid.appendChild(savStat('Gasto real', fmtEUR(monthExpenses)));
   statsGrid.appendChild(savStat('Ingresos', monthIncome > 0 ? fmtEUR(monthIncome) : '—'));
 
   const savMain = el('div', { class: 'savings-stat-item savings-stat-main' });
-  savMain.appendChild(el('span', { class: 'savings-stat-label', text: 'Ahorro del mes' }));
+  savMain.appendChild(el('span', { class: 'savings-stat-label', text: 'Ahorro real' }));
   const savValEl = el('span', { class: 'savings-stat-value' });
   if (monthIncome === 0) {
     savValEl.textContent = '—';
@@ -1961,6 +2617,20 @@ function renderSavings(container) {
   savMain.appendChild(savValEl);
   statsGrid.appendChild(savMain);
   monthCard.appendChild(statsGrid);
+
+  // Indicador secundario: ahorro proyectado si se materializa todo lo pendiente.
+  const pending = getPendingForPeriod(state.year, state.month);
+  if (monthIncome > 0 && pending.length > 0) {
+    const pendingTotal = pending.reduce((s, p) => s + p.amountCents, 0);
+    const projectedSavings = monthIncome - (monthExpenses + pendingTotal);
+    const hint = el('div', { class: 'savings-projection-hint' });
+    hint.appendChild(el('span', { text: `Si se materializa lo pendiente (${pending.length}, ${fmtEUR(pendingTotal)})` }));
+    const proj = el('span', { class: `mono ${projectedSavings >= 0 ? 'amount-pos' : 'amount-neg'}` });
+    proj.textContent = projectedSavings >= 0 ? fmtEUR(projectedSavings) : '−' + fmtEUR(-projectedSavings);
+    hint.appendChild(proj);
+    monthCard.appendChild(hint);
+  }
+
   grid.appendChild(monthCard);
 
   // ---- Tarjeta objetivo anual ----
@@ -2061,188 +2731,6 @@ function renderSavings(container) {
 /* ================================================================
    Edición inline de categoría
    ================================================================ */
-
-function openCategoryEdit(cat, row) {
-  clear(row);
-  row.classList.add('category-row--editing');
-
-  const colorInp = el('input', { type: 'color', value: cat.color || '#c47a1a', class: 'color-input' });
-  const nameInp = el('input', {
-    type: 'text', class: 'form-input',
-    value: cat.name, style: { flex: '1', minWidth: '120px' },
-  });
-  const limitInp = el('input', {
-    type: 'text', inputmode: 'decimal',
-    class: 'form-input mono',
-    value: cat.monthlyLimitCents > 0 ? (cat.monthlyLimitCents / 100).toFixed(2).replace('.', ',') : '',
-    placeholder: 'Sin límite',
-    style: { maxWidth: '140px' },
-    title: 'Límite mensual (€)',
-  });
-
-  async function save() {
-    if (!nameInp.value.trim()) return;
-    const limitCents = limitInp.value.trim() ? eurToCents(limitInp.value) : 0;
-    await DB.updateCategory({
-      ...cat,
-      name: nameInp.value.trim(),
-      color: colorInp.value,
-      icon: picker.dataset.value || '',
-      monthlyLimitCents: limitCents,
-    });
-    await reload();
-  }
-
-  const saveBtn   = el('button', { type: 'button', class: 'btn btn-primary btn-sm', text: 'Guardar',  onClick: save });
-  const cancelBtn = el('button', { type: 'button', class: 'btn btn-ghost btn-sm',   text: 'Cancelar', onClick: reload });
-
-  const topRow = el('div', { class: 'category-edit-row' }, colorInp, nameInp, limitInp, cancelBtn, saveBtn);
-  row.appendChild(topRow);
-
-  // Picker con el icono actual preseleccionado (resuelve emoji legacy → id)
-  const picker = buildIconPicker(Icons.resolve(cat.icon));
-  picker.classList.add('icon-picker--cat-edit');
-  row.appendChild(picker);
-
-  [nameInp, limitInp].forEach(inp => {
-    inp.addEventListener('keydown', e => {
-      if (e.key === 'Enter') save();
-      if (e.key === 'Escape') reload();
-    });
-  });
-
-  nameInp.focus();
-  nameInp.select();
-}
-
-/* ================================================================
-   Gastos compartidos — Personas y Liquidación
-   ================================================================ */
-
-function computeSettlement(sharedExpenses, people) {
-  if (people.length < 2) return [];
-  const paid = {};
-  people.forEach(p => { paid[p] = 0; });
-  sharedExpenses.forEach(e => {
-    if (Object.prototype.hasOwnProperty.call(paid, e.paidBy)) paid[e.paidBy] += e.amountCents;
-  });
-  const total = Object.values(paid).reduce((s, v) => s + v, 0);
-  if (total === 0) return [];
-  const fairShare = total / people.length;
-  const creditors = [], debtors = [];
-  people.forEach(p => {
-    const b = paid[p] - fairShare;
-    if (b > 1)  creditors.push({ name: p, balance: b });
-    if (b < -1) debtors.push({ name: p, balance: b });
-  });
-  creditors.sort((a, b) => b.balance - a.balance);
-  debtors.sort((a, b) => a.balance - b.balance);
-  const txs = [];
-  let ci = 0, di = 0;
-  while (ci < creditors.length && di < debtors.length) {
-    const amount = Math.min(creditors[ci].balance, -debtors[di].balance);
-    if (amount > 1) txs.push({ from: debtors[di].name, to: creditors[ci].name, amount: Math.round(amount) });
-    creditors[ci].balance -= amount;
-    debtors[di].balance  += amount;
-    if (creditors[ci].balance < 1) ci++;
-    if (-debtors[di].balance < 1) di++;
-  }
-  return txs;
-}
-
-function buildSettlementCard(monthExpenses) {
-  const shared = monthExpenses.filter(e => e.paidBy && state.people.includes(e.paidBy));
-  if (shared.length === 0) return null;
-  const txs = computeSettlement(shared, state.people);
-
-  const card = el('div', { class: 'card settlement-card' });
-  card.appendChild(
-    el('div', { class: 'card-header' },
-      el('h2', { class: 'card-title', text: 'Liquidar gastos compartidos' }),
-      el('span', { class: 'badge', text: `${shared.length} gasto${shared.length !== 1 ? 's' : ''}` }),
-    )
-  );
-
-  if (txs.length === 0) {
-    card.appendChild(el('div', { class: 'empty-state', style: { padding: '14px 0' },
-      text: '¡Todo liquidado! Los pagos están equilibrados.' }));
-  } else {
-    txs.forEach(tx => {
-      const row = el('div', { class: 'settlement-row' });
-      row.appendChild(el('span', { class: 'settlement-from', text: tx.from }));
-      row.appendChild(el('span', { class: 'settlement-arrow', text: '→' }));
-      row.appendChild(el('span', { class: 'settlement-to',   text: tx.to }));
-      row.appendChild(el('span', { class: 'settlement-amount mono', text: fmtEUR(tx.amount) }));
-      card.appendChild(row);
-    });
-  }
-
-  // Resumen de lo que pagó cada persona
-  const paid = {};
-  state.people.forEach(p => { paid[p] = 0; });
-  shared.forEach(e => { paid[e.paidBy] = (paid[e.paidBy] || 0) + e.amountCents; });
-  const total = Object.values(paid).reduce((s, v) => s + v, 0);
-
-  card.appendChild(el('hr', { class: 'divider', style: { margin: '14px 0' } }));
-  const summary = el('div', { class: 'settlement-summary' });
-  state.people.forEach(p => {
-    const pct = total > 0 ? ((paid[p] / total) * 100).toFixed(0) : 0;
-    const row = el('div', { class: 'settlement-summary-row' });
-    row.appendChild(el('span', { text: p }));
-    row.appendChild(el('span', { class: 'mono', text: `${fmtEUR(paid[p] || 0)} (${pct}%)` }));
-    summary.appendChild(row);
-  });
-  card.appendChild(summary);
-  return card;
-}
-
-function buildPeopleCard() {
-  const card = el('div', { class: 'card' });
-  card.style.maxWidth = '600px';
-  card.style.margin = '24px auto 0';
-
-  card.appendChild(el('h2', { class: 'card-title', text: 'Personas (gastos compartidos)' }));
-  const note = el('p', { class: 'expense-meta', style: { margin: '6px 0 14px' } });
-  note.textContent = 'Añade los nombres de quienes comparten gastos para calcular la liquidación mensual.';
-  card.appendChild(note);
-
-  const addRow = el('div', { class: 'people-add-row' });
-  const nameInp = el('input', { class: 'form-input', placeholder: 'Nombre (ej. María)', style: { flex: '1' } });
-  const addBtn = el('button', {
-    class: 'btn btn-primary btn-sm', text: 'Añadir',
-    onClick: async () => {
-      const name = nameInp.value.trim();
-      if (!name || state.people.includes(name)) return;
-      await DB.setSetting('people', [...state.people, name]);
-      nameInp.value = '';
-      await reload();
-    },
-  });
-  nameInp.addEventListener('keydown', e => { if (e.key === 'Enter') addBtn.click(); });
-  addRow.appendChild(nameInp);
-  addRow.appendChild(addBtn);
-  card.appendChild(addRow);
-
-  if (state.people.length > 0) {
-    card.appendChild(el('hr', { class: 'divider' }));
-    const list = el('div', { class: 'people-list' });
-    state.people.forEach(person => {
-      const row = el('div', { class: 'people-row' });
-      row.appendChild(el('span', { class: 'people-name', text: person }));
-      row.appendChild(el('button', {
-        class: 'btn-delete', html: Icons.svg('close', 14), title: 'Eliminar',
-        onClick: async () => {
-          await DB.setSetting('people', state.people.filter(p => p !== person));
-          await reload();
-        },
-      }));
-      list.appendChild(row);
-    });
-    list.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
-    card.appendChild(list);
-  }
-  return card;
-}
 
 /* ================================================================
    Importar / Exportar
@@ -2446,6 +2934,62 @@ function buildImportExportCard() {
 
 const CHANGELOG = [
   {
+    version: '1.14',
+    date: 'Mayo 2026',
+    items: [
+      'Eliminada la funcionalidad "Personas / Gastos compartidos": campo "Pagado por" fuera del form de gasto, del modal de edición y del CSV; eliminada la card de Liquidación y la sección Personas en Categorías',
+      'Quitada la card de Importar/Exportar de la vista Categorías (sigue accesible desde el menú lateral en Datos)',
+      'Vista Categorías rediseñada: botón "+ Nueva categoría" arriba y lista debajo. La creación y edición ahora se hace en un modal dedicado',
+      'Modal de categoría con preview en vivo (chip con color+icono+nombre+límite) que se actualiza al escribir, elegir color, picar icono o cambiar el límite',
+      'Mismo modal sirve para crear y editar — flujo coherente y sin form mezclado con la lista',
+    ],
+  },
+  {
+    version: '1.13',
+    date: 'Mayo 2026',
+    items: [
+      'La lista "Gastos del mes" solo muestra gastos REALES (puntuales y los materializados de recurrentes). Editar/borrar afecta solo a ese gasto concreto, nunca a la plantilla del recurrente',
+      'Los gastos anualizados ahora se materializan cada mes con importe = total anual / 12 (12 hits al año en el día elegido)',
+      'Nuevo bloque "Pendiente del mes contable" debajo de la lista: muestra los recurrentes que todavía no se han facturado en este periodo (read-only; se materializan al llegar su día)',
+      'Resumen del mes simplificado a 2 buckets reales: Puntuales (sin origen recurrente) y Fijos (con origen recurrente). Total real más línea secundaria "Esperado fin de mes" si hay pendientes',
+      'Ahorro pasa a usar el valor REAL (ingreso - gasto materializado). Si hay pendientes, una línea aparte indica "Si se materializa lo pendiente: ahorro proyectado X €"',
+      'Informes, donut y trend recalculados sobre gasto real (Fijo vs Variable, distribución anual, YoY, byDow)',
+      'Para editar la plantilla de un recurrente, ahora la única vía es la pestaña Recurrentes — separación clara entre instancia (gasto) y plantilla',
+    ],
+  },
+  {
+    version: '1.12',
+    date: 'Mayo 2026',
+    items: [
+      'Mes contable configurable: nueva sección "Mes contable" en el menú lateral permite elegir el día (1-28) en que empieza tu mes contable, útil si cobras un día concreto del mes',
+      'Convención bancaria: el periodo se nombra por el mes en que termina (ej. con día 25, "Mayo" abarca del 25-abril al 24-mayo)',
+      'Vista previa en vivo de los rangos al elegir el día, y aviso en Ahorro con las fechas exactas del periodo cuando difiere del mes natural',
+      'Día 1 (default) = comportamiento idéntico al actual (mes natural)',
+      'Gastos, Ahorro, Informes y selector de mes ahora respetan el periodo contable elegido',
+      'Calendario y heatmap diario se mantienen en mes natural (su visualización es por fecha de calendario)',
+    ],
+  },
+  {
+    version: '1.11',
+    date: 'Mayo 2026',
+    items: [
+      'Gastos recurrentes con 3 tipos de frecuencia (radio): Mensual, Anual (un pago al año en una fecha concreta), Anualizado (pago anual repartido /12)',
+      'Selector de Día de cobro tipo calendario (1-31). En tipo Anual, se amplía con selector de mes para fijar día + mes del año',
+      'Los recurrentes mensuales y anuales materializan automáticamente un gasto real al llegar su fecha (editable individualmente sin afectar a la plantilla); los anualizados siguen siendo proyección /12',
+      'Ventana de materialización: al arrancar la app se revisan los 3 últimos meses para crear los gastos que falten dentro del periodo de vigencia del recurrente',
+      'Idempotencia por instancia (clave mes-año-recurrente): no se duplican aunque la app se abra varias veces',
+      'En meses sin el día indicado (29/30/31 en febrero, 31 en meses de 30 días) el cobro se aplica el último día disponible',
+      'Pequeño icono ↻ junto al nombre de los gastos generados desde un recurrente, para distinguirlos de los ad-hoc',
+      'Fila de recurrentes rediseñada en móvil: layout en grid (nombre, importe destacado, meta, rango+botones) sin solapes',
+      'Botón Pausar/Activar de recurrente convertido en icono ⏸ / ▶ con tinte verde/ámbar según estado',
+      'Modal Añadir gasto móvil reordenado: Descripción y Fecha antes de Categoría; recuadros de categoría con color neutro y selección marcada con acento',
+      'Resumen del mes reclasificado: los gastos generados por recurrentes cuentan como Fijos (no como Puntuales), incluida la proyección de fin de mes',
+      'Informe Coste fijo vs variable: el bloque Fijo agrupa toda la huella recurrente (proyección + materializados), separado de los gastos ad-hoc',
+      'Corregido bug: la edición inline de un gasto materializado preservaba mal los vínculos al recurrente y podía duplicarse en el siguiente arranque',
+      'Importación de backup robusta: se sanea el modelo antiguo (añade paymentDay y frequency por defecto) y se desvinculan referencias huérfanas en modo Fusionar',
+    ],
+  },
+  {
     version: '1.10',
     date: 'Mayo 2026',
     items: [
@@ -2569,6 +3113,7 @@ const MAIN_TABS = [
 const CONFIG_TABS = [
   { id: 'recurring',  label: 'Recurrentes' },
   { id: 'categories', label: 'Categorías' },
+  { id: 'accounting', label: 'Mes contable' },
 ];
 
 const TAB_DEFS = [...MAIN_TABS, ...CONFIG_TABS];
@@ -2725,7 +3270,6 @@ function estimateDataBytes() {
     recurring:  state.recurring,
     income:     state.income,
     annualGoal: state.annualGoal,
-    people:     state.people,
   };
   try {
     return new Blob([JSON.stringify(payload)]).size;
@@ -2768,7 +3312,7 @@ function openMonthPicker() {
         });
         if (pickerYear === state.year && m === state.month) btn.classList.add('current');
         // Marcar meses que tienen datos
-        const hasExpenses = state.expenses.some(e => Utils.isInMonth(e.date, pickerYear, m));
+        const hasExpenses = state.expenses.some(e => isInAccountingMonth(e.date, pickerYear, m, state.payrollDay));
         const hasIncome   = state.income.some(i => i.id === `${pickerYear}-${String(m).padStart(2, '0')}`);
         if (hasExpenses || hasIncome) btn.classList.add('has-data');
 
@@ -2827,7 +3371,6 @@ async function openChangelogModal() {
     grid.appendChild(dbStat('Gastos puntuales',  state.expenses.length));
     grid.appendChild(dbStat('Recurrentes',       state.recurring.length));
     grid.appendChild(dbStat('Meses con ingresos', state.income.length));
-    grid.appendChild(dbStat('Personas',          state.people.length));
     grid.appendChild(dbStat('Total registros',   totalRecords));
     body.appendChild(grid);
 
@@ -2895,6 +3438,7 @@ function computeReportsAsync(year, refMonth) {
     expenses:   state.expenses,
     recurring:  state.recurring,
     categories: state.categories,
+    payrollDay: state.payrollDay || 1,
   };
 
   // Heurística: solo usar worker si el dataset es razonablemente grande
@@ -2918,6 +3462,8 @@ function computeReportsAsync(year, refMonth) {
 /** Versión síncrona (misma lógica que el worker, inline). */
 function computeReportsSync(payload) {
   const { year, refMonth, expenses, recurring, categories } = payload;
+  const payrollDay = state.payrollDay || 1;
+  const inYear = (e) => isInAccountingYear(e.date, year, payrollDay);
   const trend = [];
   let yy = year, mm = refMonth;
   for (let i = 0; i < 12; i++) {
@@ -2934,25 +3480,18 @@ function computeReportsSync(payload) {
     ? yearTrend.reduce((max, t) => (t.total > max.total ? t : max))
     : null;
   const yearExpenses = expenses
-    .filter((e) => e.date && e.date.startsWith(String(year)))
+    .filter(inYear)
     .sort((a, b) => b.amountCents - a.amountCents)
     .slice(0, 8);
   const catYear = {};
   categories.forEach((c) => { catYear[c.id] = { ...c, totalCents: 0 }; });
   let uncatYearTotal = 0;
   expenses.forEach((e) => {
-    if (!e.date || !e.date.startsWith(String(year))) return;
+    if (!inYear(e)) return;
     if (catYear[e.categoryId]) catYear[e.categoryId].totalCents += e.amountCents;
     else uncatYearTotal += e.amountCents;
   });
-  recurring.forEach((r) => {
-    const months = recurringMonthsInYear(r, year);
-    if (months === 0) return;
-    const monthly = r.annual ? Math.round(r.amountCents / 12) : r.amountCents;
-    const yearly = monthly * months;
-    if (catYear[r.categoryId]) catYear[r.categoryId].totalCents += yearly;
-    else uncatYearTotal += yearly;
-  });
+  // Solo gasto real: no sumamos proyección por encima.
   const catYearList = Object.values(catYear)
     .filter((c) => c.totalCents > 0)
     .sort((a, b) => b.totalCents - a.totalCents);
@@ -2964,7 +3503,9 @@ function computeReportsSync(payload) {
   }
   const catYearTotal = catYearList.reduce((s, c) => s + c.totalCents, 0) || 1;
 
-  // Heatmap diario
+  // Heatmap diario: se conserva por año NATURAL (su visualización es un grid
+  // de 12 meses × 31 días; mezclarlo con año contable produciría asociaciones
+  // raras entre la columna y la fecha real).
   const heatmap = [];
   for (let mo = 0; mo < 12; mo++) heatmap.push(new Array(31).fill(0));
   let heatmapMax = 0;
@@ -2978,40 +3519,37 @@ function computeReportsSync(payload) {
     }
   });
 
-  // Coste fijo vs variable (año seleccionado)
-  // Cada recurrente aporta (importe mensualizado × meses_activos_en_año)
-  const fixedYearly = recurring.reduce((s, r) => {
-    const months = recurringMonthsInYear(r, year);
-    if (months === 0) return s;
-    const monthly = r.annual ? Math.round(r.amountCents / 12) : r.amountCents;
-    return s + monthly * months;
-  }, 0);
+  // Coste fijo vs variable — solo gasto REAL.
+  const fixedYearly = expenses
+    .filter((e) => inYear(e) && e.sourceRecurringId)
+    .reduce((s, e) => s + e.amountCents, 0);
   const variableYearly = expenses
-    .filter((e) => e.date && e.date.startsWith(String(year)))
+    .filter((e) => inYear(e) && !e.sourceRecurringId)
     .reduce((s, e) => s + e.amountCents, 0);
 
   // Gasto por día de la semana (0=Lun, 6=Dom)
   const byDow = [0, 0, 0, 0, 0, 0, 0];
   expenses.forEach((e) => {
-    if (!e.date || !e.date.startsWith(String(year))) return;
+    if (!inYear(e)) return;
     const d = new Date(e.date + 'T12:00:00');
     if (isNaN(d.getTime())) return;
     const dow = (d.getDay() + 6) % 7;
     byDow[dow] += e.amountCents;
   });
 
-  // Inflación YoY por categoría
+  // Inflación YoY por categoría (comparando años contables completos)
   const prevYear = year - 1;
   const yoyMap = {};
   categories.forEach((c) => { yoyMap[c.id] = { ...c, current: 0, previous: 0 }; });
   expenses.forEach((e) => {
     if (!e.date) return;
-    const yy = e.date.slice(0, 4);
-    if (yy !== String(year) && yy !== String(prevYear)) return;
+    const inCur  = isInAccountingYear(e.date, year, payrollDay);
+    const inPrev = isInAccountingYear(e.date, prevYear, payrollDay);
+    if (!inCur && !inPrev) return;
     const bucket = yoyMap[e.categoryId];
     if (!bucket) return;
-    if (yy === String(year)) bucket.current += e.amountCents;
-    else bucket.previous += e.amountCents;
+    if (inCur) bucket.current += e.amountCents;
+    else       bucket.previous += e.amountCents;
   });
   const yoyList = Object.values(yoyMap)
     .filter((c) => c.current > 0 || c.previous > 0)
@@ -3157,7 +3695,6 @@ function openDayDetail(year, month, day, data) {
       info.appendChild(descSpan);
       const meta = el('span', { class: 'day-detail-meta' });
       meta.textContent = cat?.name || 'Sin categoría';
-      if (e.paidBy) meta.textContent += ` · Pagó ${e.paidBy}`;
       info.appendChild(meta);
       row.appendChild(info);
       row.appendChild(el('span', { class: 'day-detail-amount mono', text: fmtEUR(e.amountCents) }));
@@ -3416,34 +3953,6 @@ function openQuickAdd(dateOverride) {
     amtWrap.appendChild(el('span', { class: 'qa-amount-currency', text: '€' }));
     form.appendChild(amtWrap);
 
-    // Categoría como grid de botones
-    form.appendChild(el('label', { class: 'form-label', text: 'Categoría' }));
-    const catGrid = el('div', { class: 'qa-cat-grid' });
-    let selectedCatId = lastCatId && state.categories.some((c) => c.id === lastCatId)
-      ? lastCatId : null;
-    state.categories.forEach((c) => {
-      const btn = el('button', {
-        type: 'button',
-        class: 'qa-cat-btn',
-        title: c.name,
-      });
-      btn.dataset.id = c.id;
-      btn.style.borderColor = c.color;
-      const ico = el('span', { class: 'qa-cat-ico' });
-      ico.style.color = c.color;
-      ico.innerHTML = Icons.svg(c.icon, 18);
-      btn.appendChild(ico);
-      btn.appendChild(el('span', { class: 'qa-cat-name', text: c.name }));
-      if (c.id === selectedCatId) btn.classList.add('selected');
-      btn.addEventListener('click', () => {
-        catGrid.querySelectorAll('.qa-cat-btn').forEach((b) => b.classList.remove('selected'));
-        btn.classList.add('selected');
-        selectedCatId = c.id;
-      });
-      catGrid.appendChild(btn);
-    });
-    form.appendChild(catGrid);
-
     // Descripción opcional
     form.appendChild(el('label', { class: 'form-label', text: 'Descripción (opcional)' }));
     const descInput = el('input', {
@@ -3459,6 +3968,32 @@ function openQuickAdd(dateOverride) {
       value: dateOverride || today(),
     });
     form.appendChild(dateInput);
+
+    // Categoría como grid de botones
+    form.appendChild(el('label', { class: 'form-label', text: 'Categoría' }));
+    const catGrid = el('div', { class: 'qa-cat-grid' });
+    let selectedCatId = lastCatId && state.categories.some((c) => c.id === lastCatId)
+      ? lastCatId : null;
+    state.categories.forEach((c) => {
+      const btn = el('button', {
+        type: 'button',
+        class: 'qa-cat-btn',
+        title: c.name,
+      });
+      btn.dataset.id = c.id;
+      const ico = el('span', { class: 'qa-cat-ico' });
+      ico.innerHTML = Icons.svg(c.icon, 18);
+      btn.appendChild(ico);
+      btn.appendChild(el('span', { class: 'qa-cat-name', text: c.name }));
+      if (c.id === selectedCatId) btn.classList.add('selected');
+      btn.addEventListener('click', () => {
+        catGrid.querySelectorAll('.qa-cat-btn').forEach((b) => b.classList.remove('selected'));
+        btn.classList.add('selected');
+        selectedCatId = c.id;
+      });
+      catGrid.appendChild(btn);
+    });
+    form.appendChild(catGrid);
 
     // Botón guardar
     const submitBtn = el('button', { type: 'submit', class: 'btn btn-primary qa-submit', text: 'Guardar' });
@@ -3479,7 +4014,6 @@ function openQuickAdd(dateOverride) {
         description: descInput.value.trim(),
         categoryId: selectedCatId,
         tags: [],
-        paidBy: null,
       });
       localStorage.setItem('lastQuickCat', String(selectedCatId));
       closeModal();

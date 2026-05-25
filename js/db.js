@@ -3,16 +3,23 @@
  *
  * Stores:
  *   categories  { id (autoIncrement), name, color, icon, monthlyLimitCents? }
- *   expenses    { id (autoIncrement), date, amountCents, description, categoryId, tags?, paidBy? }
- *   recurring   { id (autoIncrement), name, amountCents, categoryId, annual, active }
+ *   expenses    { id (autoIncrement), date, amountCents, description, categoryId,
+ *                 tags?, paidBy?, sourceRecurringId?, recurringInstanceKey? }
+ *   recurring   { id (autoIncrement), name, amountCents, categoryId, active,
+ *                 startMonth?, endMonth?, paymentDay, paymentMonth?,
+ *                 frequency: 'monthly' | 'annualized' | 'annual' }
  *   income      { id ('YYYY-MM'), amountCents }
  *   settings    { key, value }   // 'annual-goal', 'people', etc.
  *
- * "annual" en recurring = true si el gasto es anualizado (se prorratea /12 al mes).
+ * Materialización (v3): los recurrentes mensuales generan gastos reales cuando
+ * llega su paymentDay (último día disponible del mes si paymentDay no existe).
+ *   - sourceRecurringId: id del recurrente origen
+ *   - recurringInstanceKey: 'YYYY-MM-<recurringId>' — usado para garantizar
+ *     idempotencia (no crear dos veces el mismo recurrente del mismo mes).
  */
 
 const DB_NAME = 'gastos';
-const DB_VERSION = 2;
+const DB_VERSION = 4;
 
 let _db = null;
 
@@ -22,6 +29,9 @@ function open() {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = (e) => {
       const db = e.target.result;
+      const tx = e.target.transaction;
+      const oldVersion = e.oldVersion;
+
       if (!db.objectStoreNames.contains('categories')) {
         db.createObjectStore('categories', { keyPath: 'id', autoIncrement: true });
       }
@@ -39,6 +49,46 @@ function open() {
       }
       if (!db.objectStoreNames.contains('settings')) {
         db.createObjectStore('settings', { keyPath: 'key' });
+      }
+
+      // v3: índice para idempotencia + paymentDay por defecto en recurrentes existentes.
+      if (oldVersion < 3) {
+        const expStore = tx.objectStore('expenses');
+        if (!expStore.indexNames.contains('recurringInstanceKey')) {
+          // No-unique a propósito: la mayoría de gastos no tendrán este campo
+          // y queremos evitar conflictos con múltiples 'undefined'/null. La
+          // unicidad se garantiza en código antes de insertar.
+          expStore.createIndex('recurringInstanceKey', 'recurringInstanceKey', { unique: false });
+        }
+        const recStore = tx.objectStore('recurring');
+        recStore.openCursor().onsuccess = (ev) => {
+          const cursor = ev.target.result;
+          if (!cursor) return;
+          const r = cursor.value;
+          if (r.paymentDay == null) {
+            r.paymentDay = 1;
+            cursor.update(r);
+          }
+          cursor.continue();
+        };
+      }
+
+      // v4: frequency reemplaza al boolean `annual` y añade soporte para anual one-shot.
+      //   annual:true  → frequency:'annualized' (comportamiento /12 actual)
+      //   annual:false → frequency:'monthly'
+      //   'annual' nuevo se introduce vía la UI, no via migración.
+      if (oldVersion < 4) {
+        const recStore = tx.objectStore('recurring');
+        recStore.openCursor().onsuccess = (ev) => {
+          const cursor = ev.target.result;
+          if (!cursor) return;
+          const r = cursor.value;
+          if (!r.frequency) {
+            r.frequency = r.annual ? 'annualized' : 'monthly';
+            cursor.update(r);
+          }
+          cursor.continue();
+        };
       }
     };
     req.onsuccess = (e) => { _db = e.target.result; resolve(_db); };
@@ -150,6 +200,19 @@ window.DB = {
   addExpense:       (e) => add('expenses', e),
   updateExpense:    (e) => put('expenses', e),
   deleteExpense:    (id) => remove('expenses', id),
+
+  /** Devuelve true si ya existe un gasto materializado para el instanceKey dado.
+   *  Usado por la materialización de recurrentes para garantizar idempotencia. */
+  hasExpenseByInstanceKey: async (key) => {
+    const db = await open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('expenses', 'readonly');
+      const idx = tx.objectStore('expenses').index('recurringInstanceKey');
+      const req = idx.get(key);
+      req.onsuccess = () => resolve(!!req.result);
+      req.onerror = () => reject(req.error);
+    });
+  },
 
   // Recurrentes
   getRecurring:     () => getAll('recurring'),

@@ -18,6 +18,31 @@ function isInMonth(isoDate, year, month) {
 
 function ymKey(y, m) { return `${y}-${String(m).padStart(2, '0')}`; }
 
+/** Mes contable al que pertenece una fecha. Espejo de app.js. */
+function accountingMonth(isoDate, payrollDay) {
+  if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) return null;
+  const y = parseInt(isoDate.slice(0, 4), 10);
+  const m = parseInt(isoDate.slice(5, 7), 10);
+  const d = parseInt(isoDate.slice(8, 10), 10);
+  if (!payrollDay || payrollDay <= 1) return `${y}-${String(m).padStart(2,'0')}`;
+  if (d >= payrollDay) {
+    if (m === 12) return `${y + 1}-01`;
+    return `${y}-${String(m + 1).padStart(2,'0')}`;
+  }
+  return `${y}-${String(m).padStart(2,'0')}`;
+}
+
+function isInAccountingMonth(isoDate, year, month, payrollDay) {
+  if (!isoDate) return false;
+  return accountingMonth(isoDate, payrollDay) === ymKey(year, month);
+}
+
+function isInAccountingYear(isoDate, year, payrollDay) {
+  if (!isoDate) return false;
+  const ym = accountingMonth(isoDate, payrollDay);
+  return ym != null && ym.startsWith(String(year));
+}
+
 function isRecurringActiveIn(r, year, month) {
   if (!r.active) return false;
   const ym = ymKey(year, month);
@@ -26,35 +51,23 @@ function isRecurringActiveIn(r, year, month) {
   return true;
 }
 
-function recurringMonthsInYear(r, year) {
-  if (!r.active) return 0;
-  let count = 0;
-  for (let m = 1; m <= 12; m++) {
-    if (isRecurringActiveIn(r, year, m)) count++;
-  }
-  return count;
-}
-
-function computeMonthTotal(expenses, recurring, year, month) {
-  const exp = expenses.filter((e) => isInMonth(e.date, year, month));
+function computeMonthTotal(expenses, year, month, payrollDay) {
+  const exp = expenses.filter((e) => isInAccountingMonth(e.date, year, month, payrollDay));
   const expTotal = exp.reduce((s, e) => s + e.amountCents, 0);
-  const annualMo = recurring
-    .filter((r) => isRecurringActiveIn(r, year, month) && r.annual)
-    .reduce((s, r) => s + Math.round(r.amountCents / 12), 0);
-  const recurringT = recurring
-    .filter((r) => isRecurringActiveIn(r, year, month) && !r.annual)
-    .reduce((s, r) => s + r.amountCents, 0);
-  return { total: expTotal + annualMo + recurringT, expCount: exp.length };
+  // Solo gasto REAL. Las proyecciones no se suman aquí.
+  return { total: expTotal, expCount: exp.length };
 }
 
 function computeReports(payload) {
   const { year, refMonth, expenses, recurring, categories } = payload;
+  const payrollDay = payload.payrollDay || 1;
+  const inYear = (e) => isInAccountingYear(e.date, year, payrollDay);
 
-  // Trend últimos 12 meses
+  // Trend últimos 12 meses (todo real)
   const trend = [];
   let y = year, m = refMonth;
   for (let i = 0; i < 12; i++) {
-    trend.unshift({ year: y, month: m, ...computeMonthTotal(expenses, recurring, y, m) });
+    trend.unshift({ year: y, month: m, ...computeMonthTotal(expenses, y, m, payrollDay) });
     if (m === 1) { m = 12; y--; } else m--;
   }
 
@@ -69,29 +82,22 @@ function computeReports(payload) {
     ? yearTrend.reduce((max, t) => (t.total > max.total ? t : max))
     : null;
 
-  // Top gastos del año
+  // Top gastos del año (contable)
   const yearExpenses = expenses
-    .filter((e) => /^\d{4}-/.test(e.date || '') && e.date.startsWith(String(year)))
+    .filter(inYear)
     .sort((a, b) => b.amountCents - a.amountCents)
     .slice(0, 8);
 
-  // Distribución anual por categoría
+  // Distribución anual por categoría (año contable)
   const catYear = {};
   categories.forEach((c) => { catYear[c.id] = { ...c, totalCents: 0 }; });
   let uncatYearTotal = 0;
   expenses.forEach((e) => {
-    if (!e.date || !e.date.startsWith(String(year))) return;
+    if (!inYear(e)) return;
     if (catYear[e.categoryId]) catYear[e.categoryId].totalCents += e.amountCents;
     else uncatYearTotal += e.amountCents;
   });
-  recurring.forEach((r) => {
-    const months = recurringMonthsInYear(r, year);
-    if (months === 0) return;
-    const monthly = r.annual ? Math.round(r.amountCents / 12) : r.amountCents;
-    const yearly = monthly * months;
-    if (catYear[r.categoryId]) catYear[r.categoryId].totalCents += yearly;
-    else uncatYearTotal += yearly;
-  });
+  // Solo gasto real: nada de añadir proyección por encima.
   const catYearList = Object.values(catYear)
     .filter((c) => c.totalCents > 0)
     .sort((a, b) => b.totalCents - a.totalCents);
@@ -117,41 +123,39 @@ function computeReports(payload) {
     }
   });
 
-  // Coste fijo vs variable (año seleccionado)
-  // Cada recurrente aporta (importe mensualizado × meses activos del año).
-  const fixedYearly = recurring.reduce((s, r) => {
-    const months = recurringMonthsInYear(r, year);
-    if (months === 0) return s;
-    const monthly = r.annual ? Math.round(r.amountCents / 12) : r.amountCents;
-    return s + monthly * months;
-  }, 0);
+  // Coste fijo vs variable — solo gasto REAL.
+  // Fijo = gastos materializados desde un recurrente (sourceRecurringId presente).
+  // Variable = gastos ad-hoc.
+  const fixedYearly = expenses
+    .filter((e) => inYear(e) && e.sourceRecurringId)
+    .reduce((s, e) => s + e.amountCents, 0);
   const variableYearly = expenses
-    .filter((e) => e.date && e.date.startsWith(String(year)))
+    .filter((e) => inYear(e) && !e.sourceRecurringId)
     .reduce((s, e) => s + e.amountCents, 0);
 
-  // Gasto por día de la semana (solo puntuales del año). 0=Lun, 6=Dom.
+  // Gasto por día de la semana (año contable). 0=Lun, 6=Dom.
   const byDow = [0, 0, 0, 0, 0, 0, 0];
   expenses.forEach((e) => {
-    if (!e.date || !e.date.startsWith(String(year))) return;
-    // mediodía para evitar saltos por zona horaria
+    if (!inYear(e)) return;
     const d = new Date(e.date + 'T12:00:00');
     if (isNaN(d.getTime())) return;
-    const dow = (d.getDay() + 6) % 7; // JS: 0=Dom..6=Sáb → 0=Lun..6=Dom
+    const dow = (d.getDay() + 6) % 7;
     byDow[dow] += e.amountCents;
   });
 
-  // Inflación YoY por categoría (año actual vs año anterior, solo puntuales)
+  // Inflación YoY por categoría (comparando años contables)
   const prevYear = year - 1;
   const yoyMap = {};
   categories.forEach((c) => { yoyMap[c.id] = { ...c, current: 0, previous: 0 }; });
   expenses.forEach((e) => {
     if (!e.date) return;
-    const yy = e.date.slice(0, 4);
-    if (yy !== String(year) && yy !== String(prevYear)) return;
+    const inCur  = isInAccountingYear(e.date, year, payrollDay);
+    const inPrev = isInAccountingYear(e.date, prevYear, payrollDay);
+    if (!inCur && !inPrev) return;
     const bucket = yoyMap[e.categoryId];
     if (!bucket) return;
-    if (yy === String(year)) bucket.current += e.amountCents;
-    else bucket.previous += e.amountCents;
+    if (inCur) bucket.current += e.amountCents;
+    else       bucket.previous += e.amountCents;
   });
   const yoyList = Object.values(yoyMap)
     .filter((c) => c.current > 0 || c.previous > 0)
