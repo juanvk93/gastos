@@ -1893,6 +1893,13 @@ async function renderReports(container) {
       sub ? el('span', { class: 'stat-sub', text: sub }) : null,
     );
   }
+  function statText(label, valueText, sub) {
+    return el('div', { class: 'stat-item' },
+      el('span', { class: 'stat-label', text: label }),
+      el('span', { class: 'stat-value mono', text: valueText }),
+      sub ? el('span', { class: 'stat-sub', text: sub }) : null,
+    );
+  }
   statG.appendChild(stat('Total año', yearTotal, `${yearTrend.length} mes${yearTrend.length !== 1 ? 'es' : ''}`));
   statG.appendChild(stat('Media mensual', yearAvg, 'promedio'));
   if (yearBest && yearBest.total > 0) {
@@ -1900,6 +1907,22 @@ async function renderReports(container) {
   }
   if (yearWorst && yearWorst.total > 0) {
     statG.appendChild(stat('Peor mes', yearWorst.total, Utils.monthName(yearWorst.month)));
+  }
+  // Categoría top + % del total anual
+  if (catYearList.length > 0 && catYearTotal > 0) {
+    const top = catYearList[0];
+    const topPct = ((top.totalCents / catYearTotal) * 100).toFixed(1).replace('.', ',');
+    statG.appendChild(stat('Categoría top', top.totalCents, `${top.name} · ${topPct}%`));
+  }
+  // Tasa de ahorro anual: (ingresos - gastos) / ingresos
+  const yearIncome = state.income
+    .filter(i => i.id && i.id.startsWith(`${state.year}-`))
+    .reduce((s, i) => s + (i.amountCents || 0), 0);
+  if (yearIncome > 0) {
+    const savings = yearIncome - yearTotal;
+    const rate = (savings / yearIncome) * 100;
+    const rateText = `${rate.toFixed(1).replace('.', ',')}%`;
+    statG.appendChild(statText('Tasa de ahorro', rateText, `ahorro ${fmtEUR(savings)}`));
   }
   statsCard.appendChild(statG);
   grid.appendChild(statsCard);
@@ -2925,6 +2948,15 @@ function openImportCSVModal() {
 
 const CHANGELOG = [
   {
+    version: '1.15',
+    date: 'Mayo 2026',
+    items: [
+      'Informes · "Año en números" ampliado con tres KPIs nuevos: Mejor mes, Categoría top (con % sobre el total anual) y Tasa de ahorro anual (ingresos vs gastos)',
+      'Corregido bug: "Mejor mes" no aparecía cuando algún mes del año en curso tenía 0 gastos (se confundía el mes vacío con el "mejor"). Ahora best/worst se calculan solo entre meses con gasto real',
+      'Si solo hay un mes con datos, Mejor y Peor mes se muestran ambos aunque coincidan',
+    ],
+  },
+  {
     version: '1.14',
     date: 'Mayo 2026',
     items: [
@@ -3450,11 +3482,14 @@ function computeReportsSync(payload) {
   const yearTrend = trend.filter((t) => t.year === year);
   const yearTotal = yearTrend.reduce((s, t) => s + t.total, 0);
   const yearAvg = yearTrend.length ? Math.round(yearTotal / yearTrend.length) : 0;
-  const yearBest = yearTrend.length
-    ? yearTrend.reduce((min, t) => (t.total < min.total ? t : min))
+  // Best/Worst se calculan solo entre meses con gasto real (>0)
+  // para que un mes vacío no sea "mejor" por defecto.
+  const yearTrendActive = yearTrend.filter((t) => t.total > 0);
+  const yearBest = yearTrendActive.length
+    ? yearTrendActive.reduce((min, t) => (t.total < min.total ? t : min))
     : null;
-  const yearWorst = yearTrend.length
-    ? yearTrend.reduce((max, t) => (t.total > max.total ? t : max))
+  const yearWorst = yearTrendActive.length
+    ? yearTrendActive.reduce((max, t) => (t.total > max.total ? t : max))
     : null;
   const yearExpenses = expenses
     .filter(inYear)

@@ -60,11 +60,14 @@ function computeReports(payload) {
   const yearTrend = trend.filter((t) => t.year === year);
   const yearTotal = yearTrend.reduce((s, t) => s + t.total, 0);
   const yearAvg = yearTrend.length ? Math.round(yearTotal / yearTrend.length) : 0;
-  const yearBest = yearTrend.length
-    ? yearTrend.reduce((min, t) => (t.total < min.total ? t : min))
+  // Best/Worst se calculan solo entre meses con gasto real (>0)
+  // para que un mes vacío no sea "mejor" por defecto.
+  const yearTrendActive = yearTrend.filter((t) => t.total > 0);
+  const yearBest = yearTrendActive.length
+    ? yearTrendActive.reduce((min, t) => (t.total < min.total ? t : min))
     : null;
-  const yearWorst = yearTrend.length
-    ? yearTrend.reduce((max, t) => (t.total > max.total ? t : max))
+  const yearWorst = yearTrendActive.length
+    ? yearTrendActive.reduce((max, t) => (t.total > max.total ? t : max))
     : null;
 
   // Top gastos del año (contable)
