@@ -1,20 +1,13 @@
 /**
  * reports-worker.js — Worker para cálculos de informes anuales
  *
- * Recibe { year, expenses, recurring, categories } y devuelve los datos
+ * Recibe { year, refMonth, expenses, categories, payrollDay } y devuelve los datos
  * agregados (trend, top expenses, distribución por categoría, heatmap).
  *
  * Se ejecuta en un hilo separado para no bloquear el render cuando
  * hay muchos gastos. Si el navegador no soporta Workers, app.js
  * llamará a las mismas funciones de forma síncrona vía `computeReports`.
  */
-
-function isInMonth(isoDate, year, month) {
-  if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) return false;
-  const y = parseInt(isoDate.slice(0, 4), 10);
-  const m = parseInt(isoDate.slice(5, 7), 10);
-  return y === year && m === month;
-}
 
 function ymKey(y, m) { return `${y}-${String(m).padStart(2, '0')}`; }
 
@@ -43,14 +36,6 @@ function isInAccountingYear(isoDate, year, payrollDay) {
   return ym != null && ym.startsWith(String(year));
 }
 
-function isRecurringActiveIn(r, year, month) {
-  if (!r.active) return false;
-  const ym = ymKey(year, month);
-  if (r.startMonth && ym < r.startMonth) return false;
-  if (r.endMonth   && ym > r.endMonth)   return false;
-  return true;
-}
-
 function computeMonthTotal(expenses, year, month, payrollDay) {
   const exp = expenses.filter((e) => isInAccountingMonth(e.date, year, month, payrollDay));
   const expTotal = exp.reduce((s, e) => s + e.amountCents, 0);
@@ -59,7 +44,7 @@ function computeMonthTotal(expenses, year, month, payrollDay) {
 }
 
 function computeReports(payload) {
-  const { year, refMonth, expenses, recurring, categories } = payload;
+  const { year, refMonth, expenses, categories } = payload;
   const payrollDay = payload.payrollDay || 1;
   const inYear = (e) => isInAccountingYear(e.date, year, payrollDay);
 

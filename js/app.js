@@ -637,9 +637,8 @@ function buildJSONImportPreview(jsonText, container) {
     status.textContent = mode === 'replace' ? 'Reemplazando datos…' : 'Fusionando datos…';
     try {
       await applyJSONImport(backup, mode);
-      // reload() reconstruye la vista actual, así que el mensaje en `status` se pierde.
-      // Avisamos con alert tras refrescar.
       await reload();
+      closeModal();
       alert(mode === 'replace'
         ? 'Backup restaurado correctamente.'
         : 'Backup fusionado correctamente.');
@@ -2255,7 +2254,8 @@ function openCategoryModal(cat) {
       const iconId = picker.dataset.value || '';
       previewIcon.innerHTML = Icons.has(iconId) ? Icons.svg(iconId, 18) : '';
       const raw = limitInp.value.trim();
-      previewLimit.textContent = raw ? `${fmtEUR(eurToCents(raw))} /mes` : '';
+      const cents = raw ? eurToCents(raw) : 0;
+      previewLimit.textContent = cents > 0 ? `${fmtEUR(cents)} /mes` : '';
     }
     nameInp.addEventListener('input', refreshPreview);
     colorInp.addEventListener('input', refreshPreview);
@@ -2856,76 +2856,67 @@ function buildImportPreview(csvText, container) {
     }
     importBtn.textContent = `✓ ${imported} gasto${imported !== 1 ? 's' : ''} importados`;
     importBtn.disabled = true;
-    if (imported > 0) await reload();
+    if (imported > 0) {
+      await reload();
+      closeModal();
+      alert(`Se importaron ${imported} gasto${imported !== 1 ? 's' : ''} del CSV.`);
+    }
   });
   mappingDiv.appendChild(importBtn);
   container.appendChild(mappingDiv);
 }
 
-function buildImportExportCard() {
-  const card = el('div', { class: 'card' });
-  card.style.maxWidth = '600px';
-  card.style.margin = '24px auto 0';
+/** Modal para importar backup JSON: file picker + preview con elegir
+ *  Reemplazar/Fusionar. Reutiliza buildJSONImportPreview. */
+function openImportJSONModal() {
+  openModal('Importar JSON', (body) => {
+    body.appendChild(el('p', {
+      class: 'expense-meta',
+      style: { marginBottom: '12px' },
+      text: 'Restaura un backup previamente exportado. Podrás elegir entre reemplazar todo o fusionar con los datos actuales.',
+    }));
+    const id = 'import-json-modal-' + Date.now();
+    const input = el('input', { type: 'file', accept: '.json,application/json', id, class: 'ie-file-input' });
+    const label = el('label', { class: 'btn btn-ghost ie-file-label', html: '↓ Seleccionar archivo JSON', for: id });
+    body.appendChild(el('div', { class: 'ie-file-wrap' }, input, label));
 
-  card.appendChild(el('h2', { class: 'card-title', text: 'Importar / Exportar' }));
+    const previewArea = el('div', { class: 'import-preview-area' });
+    body.appendChild(previewArea);
 
-  card.appendChild(el('div', { class: 'report-section-title', style: { marginBottom: '10px' }, text: 'Exportar' }));
-  const exportRow = el('div', { class: 'ie-export-row' });
-  exportRow.appendChild(el('button', { class: 'btn btn-ghost', text: '↑ Backup JSON',   onClick: exportJSON }));
-  exportRow.appendChild(el('button', { class: 'btn btn-ghost', text: '↑ Gastos CSV (Excel)', onClick: exportCSV }));
-  card.appendChild(exportRow);
-
-  card.appendChild(el('hr', { class: 'divider' }));
-  card.appendChild(el('div', { class: 'report-section-title', style: { marginBottom: '8px' }, text: 'Importar backup (JSON)' }));
-  const jsonNote = el('p', { class: 'expense-meta', style: { marginBottom: '12px' } });
-  jsonNote.textContent = 'Restaura un backup completo previamente exportado. Podrás elegir reemplazar todo o fusionar con los datos actuales.';
-  card.appendChild(jsonNote);
-
-  const jsonWrap = el('div', { class: 'ie-file-wrap' });
-  const jsonId   = 'import-json-' + Date.now();
-  const jsonInput = el('input', { type: 'file', accept: '.json,application/json', id: jsonId, class: 'ie-file-input' });
-  const jsonLabel = el('label', { class: 'btn btn-ghost ie-file-label', html: '↓ Seleccionar JSON', for: jsonId });
-  jsonWrap.appendChild(jsonInput);
-  jsonWrap.appendChild(jsonLabel);
-  card.appendChild(jsonWrap);
-
-  const jsonPreviewArea = el('div', { class: 'import-preview-area' });
-  card.appendChild(jsonPreviewArea);
-
-  jsonInput.addEventListener('change', () => {
-    const file = jsonInput.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = e => buildJSONImportPreview(e.target.result, jsonPreviewArea);
-    reader.readAsText(file, 'utf-8');
+    input.addEventListener('change', () => {
+      const file = input.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (e) => buildJSONImportPreview(e.target.result, previewArea);
+      reader.readAsText(file, 'utf-8');
+    });
   });
+}
 
-  card.appendChild(el('hr', { class: 'divider' }));
-  card.appendChild(el('div', { class: 'report-section-title', style: { marginBottom: '8px' }, text: 'Importar extracto bancario (CSV)' }));
-  const note = el('p', { class: 'expense-meta', style: { marginBottom: '12px' } });
-  note.textContent = 'Exporta el extracto de tu banco como CSV. Podrás asignar las columnas antes de importar.';
-  card.appendChild(note);
+/** Modal para importar extracto CSV: file picker + mapeo de columnas + importar. */
+function openImportCSVModal() {
+  openModal('Importar CSV', (body) => {
+    body.appendChild(el('p', {
+      class: 'expense-meta',
+      style: { marginBottom: '12px' },
+      text: 'Exporta el extracto de tu banco como CSV. Podrás asignar las columnas (fecha, importe, descripción) antes de importar.',
+    }));
+    const id = 'import-csv-modal-' + Date.now();
+    const input = el('input', { type: 'file', accept: '.csv,.txt', id, class: 'ie-file-input' });
+    const label = el('label', { class: 'btn btn-ghost ie-file-label', html: '↓ Seleccionar archivo CSV', for: id });
+    body.appendChild(el('div', { class: 'ie-file-wrap' }, input, label));
 
-  const fileWrap = el('div', { class: 'ie-file-wrap' });
-  const fileId   = 'import-file-' + Date.now();
-  const fileInput = el('input', { type: 'file', accept: '.csv,.txt', id: fileId, class: 'ie-file-input' });
-  const fileLabel = el('label', { class: 'btn btn-ghost ie-file-label', html: '↓ Seleccionar CSV', for: fileId });
-  fileWrap.appendChild(fileInput);
-  fileWrap.appendChild(fileLabel);
-  card.appendChild(fileWrap);
+    const previewArea = el('div', { class: 'import-preview-area' });
+    body.appendChild(previewArea);
 
-  const previewArea = el('div', { class: 'import-preview-area' });
-  card.appendChild(previewArea);
-
-  fileInput.addEventListener('change', () => {
-    const file = fileInput.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = e => buildImportPreview(e.target.result, previewArea);
-    reader.readAsText(file, 'utf-8');
+    input.addEventListener('change', () => {
+      const file = input.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (e) => buildImportPreview(e.target.result, previewArea);
+      reader.readAsText(file, 'utf-8');
+    });
   });
-
-  return card;
 }
 
 /* ================================================================
@@ -3201,25 +3192,10 @@ function buildSidebar() {
     return btn;
   }
 
-  secData.appendChild(dataBtn('↑', 'Exportar backup JSON', () => { exportJSON(); closeSidebar(); }));
-  secData.appendChild(dataBtn('↑', 'Exportar gastos CSV',  () => { exportCSV();  closeSidebar(); }));
-
-  function openImportFile(selector) {
-    closeSidebar();
-    switchToTab('categories');
-    setTimeout(() => {
-      const lbl = document.querySelector(selector);
-      if (lbl) {
-        lbl.click();
-        lbl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }
-    }, 100);
-  }
-
-  secData.appendChild(dataBtn('↓', 'Importar backup JSON',
-    () => openImportFile('label[for^="import-json-"]')));
-  secData.appendChild(dataBtn('↓', 'Importar extracto CSV',
-    () => openImportFile('label[for^="import-file-"]')));
+  secData.appendChild(dataBtn('↑', 'Exportar JSON', () => { exportJSON(); closeSidebar(); }));
+  secData.appendChild(dataBtn('↑', 'Exportar CSV', () => { exportCSV();  closeSidebar(); }));
+  secData.appendChild(dataBtn('↓', 'Importar JSON', () => { closeSidebar(); openImportJSONModal(); }));
+  secData.appendChild(dataBtn('↓', 'Importar CSV',  () => { closeSidebar(); openImportCSVModal();  }));
   body.appendChild(secData);
 
   // ---- Sección: Información ----
@@ -3432,11 +3408,12 @@ function getReportsWorker() {
 
 /** Calcula informes en worker si es posible; síncrono si no. */
 function computeReportsAsync(year, refMonth) {
+  // Solo enviamos al worker lo que necesita: expenses (real), categories y
+  // payrollDay. `recurring` ya no se proyecta en informes ("real-only").
   const payload = {
     year,
     refMonth,
     expenses:   state.expenses,
-    recurring:  state.recurring,
     categories: state.categories,
     payrollDay: state.payrollDay || 1,
   };
@@ -3461,7 +3438,7 @@ function computeReportsAsync(year, refMonth) {
 
 /** Versión síncrona (misma lógica que el worker, inline). */
 function computeReportsSync(payload) {
-  const { year, refMonth, expenses, recurring, categories } = payload;
+  const { year, refMonth, expenses, categories } = payload;
   const payrollDay = state.payrollDay || 1;
   const inYear = (e) => isInAccountingYear(e.date, year, payrollDay);
   const trend = [];

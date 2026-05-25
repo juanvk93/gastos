@@ -176,6 +176,10 @@ h1, h2, h3 { font-family: var(--font-display); letter-spacing: -0.02em; }
   box-shadow: var(--shadow);
 }
 
+/* Separación entre cards hermanas (p.ej. "Gastos del mes" + "Pendiente del mes
+   contable" + "Proyección fin de mes" en la vista Gastos). */
+.main-wrap > .card + .card { margin-top: 20px; }
+
 .card-header {
   display: flex;
   align-items: center;
@@ -1589,13 +1593,6 @@ select.form-input {
 
 /* ---- Importar / Exportar ---- */
 
-.ie-export-row {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-bottom: 4px;
-}
-
 .ie-file-wrap {
   display: flex;
   align-items: center;
@@ -1692,7 +1689,6 @@ select.form-input {
 
 @media (max-width: 600px) {
   .import-mapping { grid-template-columns: 1fr; }
-  .ie-export-row  { flex-direction: column; }
   .import-json-actions { flex-direction: column; }
   .import-json-actions .btn { width: 100%; }
 }
@@ -2370,8 +2366,6 @@ button.month-nav-text:hover { background: var(--ink-100); }
   .income-month { font-size: 0.75rem; }
 
   /* Import / Export */
-  .ie-export-row { flex-direction: column; gap: 8px; }
-  .ie-export-row .btn { width: 100%; }
   .ie-file-label { display: block; text-align: center; }
   .import-mapping { grid-template-columns: 1fr; }
   .import-table-wrap { overflow-x: auto; }
