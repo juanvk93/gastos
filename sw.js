@@ -8,7 +8,7 @@
  *   - Fallback a la app shell si la red falla.
  */
 
-const CACHE_VERSION = 'gastos-v1.17';
+const CACHE_VERSION = 'gastos-v1.18';
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const RUNTIME_CACHE = `${CACHE_VERSION}-runtime`;
 

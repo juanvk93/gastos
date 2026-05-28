@@ -85,6 +85,7 @@ function bindGlobalEvents() {
     document.documentElement.setAttribute('data-theme', next);
     localStorage.setItem('theme', next);
     updateThemeIcon(next);
+    if (window.DonutChart && DonutChart.updateTheme) DonutChart.updateTheme();
   });
 
   // Sidebar
@@ -837,21 +838,39 @@ function renderDashboard(container) {
   chartWrap.appendChild(centerOverlay);
   leftCol.appendChild(chartWrap);
 
-  // Leyenda
+  // Leyenda interactiva: click sobre un item enfoca/desfoca el segmento.
   if (chartData.length > 0) {
     const legend = el('div', { class: 'chart-legend' });
-    chartData.forEach(c => {
+    const items = [];
+    chartData.forEach((c, idx) => {
       const pct = realTotal > 0 ? ((c.totalCents / realTotal) * 100).toFixed(1) : '0.0';
       const nameSpan = el('span', { class: 'legend-name' });
       appendIconText(nameSpan, c.icon, c.name, 12);
-      legend.appendChild(
-        el('div', { class: 'legend-item' },
-          el('span', { class: 'legend-dot', style: { backgroundColor: c.color } }),
-          nameSpan,
-          el('span', { class: 'legend-value', text: fmtEUR(c.totalCents) }),
-          el('span', { class: 'legend-pct', text: `${pct}%` }),
-        )
+      const item = el('button', {
+        class: 'legend-item',
+        type: 'button',
+        'aria-pressed': 'false',
+        'data-idx': String(idx),
+      },
+        el('span', { class: 'legend-dot', style: { backgroundColor: c.color } }),
+        nameSpan,
+        el('span', { class: 'legend-value', text: fmtEUR(c.totalCents) }),
+        el('span', { class: 'legend-pct', text: `${pct}%` }),
       );
+      item.addEventListener('click', () => {
+        const current = DonutChart.getFocus();
+        const next = current === idx ? null : idx;
+        DonutChart.setFocus(next);
+        items.forEach((it, i) => {
+          const focused = next === i;
+          const dimmed  = next != null && !focused;
+          it.classList.toggle('focused', focused);
+          it.classList.toggle('dimmed', dimmed);
+          it.setAttribute('aria-pressed', focused ? 'true' : 'false');
+        });
+      });
+      items.push(item);
+      legend.appendChild(item);
     });
     leftCol.appendChild(legend);
   }
@@ -3208,6 +3227,7 @@ function buildSidebar() {
     document.documentElement.setAttribute('data-theme', next);
     localStorage.setItem('theme', next);
     updateThemeIcon(next);
+    if (window.DonutChart && DonutChart.updateTheme) DonutChart.updateTheme();
   });
 
   body.appendChild(secTheme);
