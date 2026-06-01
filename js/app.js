@@ -446,14 +446,25 @@ function downloadFile(content, filename, mime) {
   URL.revokeObjectURL(url);
 }
 
+/** Valida que (year, month, day) formen una fecha de calendario real. */
+function isValidYMD(y, mo, d) {
+  if (mo < 1 || mo > 12 || d < 1) return false;
+  return d <= new Date(y, mo, 0).getDate(); // último día real del mes
+}
+
 function parseImportDate(str) {
   if (!str) return null;
   str = str.trim();
+  let y, mo, d;
   let m = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-  if (m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
-  m = str.match(/^(\d{4})[\/\-](\d{2})[\/\-](\d{2})$/);
-  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
-  return null;
+  if (m) { d = +m[1]; mo = +m[2]; y = +m[3]; }
+  else {
+    m = str.match(/^(\d{4})[\/\-](\d{2})[\/\-](\d{2})$/);
+    if (m) { y = +m[1]; mo = +m[2]; d = +m[3]; }
+    else return null;
+  }
+  if (!isValidYMD(y, mo, d)) return null;
+  return `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
 }
 
 function exportJSON() {
@@ -1110,8 +1121,8 @@ function buildExpenseForm() {
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const cents = eurToCents(amountInput.value);
-    const catId = parseInt(select.value);
-    if (!cents || !catId) return;
+    const catId = parseInt(select.value, 10);
+    if (cents <= 0 || !catId) return;
     await DB.addExpense({
       date: dateInput.value || today(),
       amountCents: cents,
@@ -1298,8 +1309,8 @@ function openInlineEdit(item, row) {
 
   async function save() {
     const cents = eurToCents(amtInput.value);
-    const catId = parseInt(catSelect.value);
-    if (!cents || !catId) return;
+    const catId = parseInt(catSelect.value, 10);
+    if (cents <= 0 || !catId) return;
     // Spread del original para preservar campos no editables aquí (sourceRecurringId,
     // recurringInstanceKey…). Sin esto, un gasto materializado perdería su vínculo y
     // se rematerializaría en el siguiente boot → duplicado.
@@ -1611,8 +1622,8 @@ function renderRecurring(container) {
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const cents = eurToCents(amtInput.value);
-    const catId = parseInt(catSelect.value);
-    if (!nameInput.value.trim() || !cents || !catId) return;
+    const catId = parseInt(catSelect.value, 10);
+    if (!nameInput.value.trim() || cents <= 0 || !catId) return;
     if (!dayPicker.isValid()) {
       alert('Selecciona la fecha de cobro');
       return;
@@ -1829,8 +1840,8 @@ function openRecurringEdit(r) {
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const cents = eurToCents(amtInput.value);
-      const catId = parseInt(catSelect.value);
-      if (!nameInput.value.trim() || !cents || !catId) return;
+      const catId = parseInt(catSelect.value, 10);
+      if (!nameInput.value.trim() || cents <= 0 || !catId) return;
       if (!dayPicker.isValid()) {
         alert('Selecciona la fecha de cobro');
         return;
@@ -2872,10 +2883,10 @@ function buildImportPreview(csvText, container) {
     text: `Importar ${dataRows.length} filas`,
   });
   importBtn.addEventListener('click', async () => {
-    const dIdx    = parseInt(selDate.value);
-    const aIdx    = parseInt(selAmt.value);
-    const descIdx = parseInt(selDesc.value);
-    const catId   = selCat.value ? parseInt(selCat.value) : null;
+    const dIdx    = parseInt(selDate.value, 10);
+    const aIdx    = parseInt(selAmt.value, 10);
+    const descIdx = parseInt(selDesc.value, 10);
+    const catId   = selCat.value ? parseInt(selCat.value, 10) : null;
     const onlyNeg = onlyNegChk.checked;
     if (isNaN(dIdx) || dIdx < 0) { alert('Selecciona la columna de fecha'); return; }
     if (isNaN(aIdx) || aIdx < 0) { alert('Selecciona la columna de importe'); return; }
@@ -2884,11 +2895,11 @@ function buildImportPreview(csvText, container) {
     for (const row of dataRows) {
       const dateStr = parseImportDate(row[dIdx] || '');
       if (!dateStr) continue;
-      const amtStr   = (row[aIdx] || '').replace(',', '.').replace(/[^\d.\-]/g, '');
-      const amtFloat = parseFloat(amtStr);
-      if (isNaN(amtFloat) || amtFloat === 0) continue;
-      if (onlyNeg && amtFloat > 0) continue;
-      const cents = Math.round(Math.abs(amtFloat) * 100);
+      // Reutiliza el parser robusto (maneja miles "1.234,56" y el signo).
+      const signed = eurToCents(row[aIdx] || '');
+      if (signed === 0) continue;
+      if (onlyNeg && signed > 0) continue;
+      const cents = Math.abs(signed);
       if (cents === 0) continue;
       const desc = descIdx >= 0 && !isNaN(descIdx) ? row[descIdx] || '' : '';
       const expense = { date: dateStr, amountCents: cents, description: desc, tags: [] };
@@ -2966,6 +2977,17 @@ function openImportCSVModal() {
    ================================================================ */
 
 const CHANGELOG = [
+  {
+    version: '1.16',
+    date: 'Junio 2026',
+    items: [
+      'Corregido bug grave de importes con separador de miles: "1.234,56 €" se interpretaba como 1,23 € (pérdida de un factor de ~1000). El parser ahora detecta correctamente el separador decimal (es-ES y en-US) y elimina los de miles, tanto al escribir importes a mano como al importar extractos bancarios CSV',
+      'Importación CSV reforzada: las fechas imposibles (mes 13, día 32, 30-feb…) se descartan en vez de guardarse como gastos invisibles',
+      'Los formularios rechazan ahora importes negativos o cero (antes un importe negativo restaba del total del mes)',
+      'Seguridad: Chart.js cargado desde el CDN con Subresource Integrity (SRI) y crossorigin — el navegador bloquea el script si sus bytes han sido alterados, evitando la ejecución de código de terceros',
+      'Robustez interna: parseInt con base 10 explícita en la lectura de selectores e identificadores',
+    ],
+  },
   {
     version: '1.15',
     date: 'Mayo 2026',
@@ -3969,7 +3991,7 @@ function buildYoYCard(yoyList, year, prevYear) {
    ================================================================ */
 
 function openQuickAdd(dateOverride) {
-  const lastCatId = parseInt(localStorage.getItem('lastQuickCat')) || null;
+  const lastCatId = parseInt(localStorage.getItem('lastQuickCat'), 10) || null;
 
   openModal('Añadir gasto', (body) => {
     const form = el('form', { class: 'quick-add-form' });
@@ -4034,7 +4056,7 @@ function openQuickAdd(dateOverride) {
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const cents = eurToCents(amtInput.value);
-      if (!cents) { amtInput.focus(); return; }
+      if (cents <= 0) { amtInput.focus(); return; }
       if (!selectedCatId) {
         catGrid.classList.add('shake');
         setTimeout(() => catGrid.classList.remove('shake'), 400);

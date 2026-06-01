@@ -79,8 +79,14 @@
   <button id="btn-quick-add" class="fab-quick-add" aria-label="Añadir gasto rápido" title="Añadir gasto"></button>
 
   <!-- ===== Scripts ===== -->
-  <!-- Chart.js desde CDN (se cachea con service worker tras la primera carga) -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <!-- Chart.js desde CDN (se cachea con service worker tras la primera carga).
+       integrity (SRI) + crossorigin: el navegador rechaza el script si el CDN
+       sirviera bytes alterados, evitando ejecución de código de terceros. -->
+  <script
+    src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"
+    integrity="sha384-NrKB+u6Ts6AtkIhwPixiKTzgSKNblyhlk0Sohlgar9UHUBzai/sgnNNWWd291xqt"
+    crossorigin="anonymous"
+    referrerpolicy="no-referrer"></script>
 
   <!-- Módulos de la app (orden importa: db → utils → icons → chart → app) -->
   <script src="js/db.js"></script>

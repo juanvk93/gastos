@@ -11,9 +11,31 @@ window.Utils = {
     }).format((cents || 0) / 100);
   },
 
-  /** Euros (float string con coma) a céntimos enteros */
+  /** Euros (string) a céntimos enteros.
+   *  Robusto frente a separadores de miles y al separador decimal es-ES/en-US:
+   *  el ÚLTIMO separador (',' o '.') que aparece se trata como decimal y el otro
+   *  como separador de miles. Así "1.234,56" → 123456 y "1,234.56" → 123456.
+   *  (Antes "1.234,56" se interpretaba erróneamente como 1,23 €.) */
   eurToCents(str) {
-    const n = parseFloat(String(str).replace(',', '.'));
+    let s = String(str).trim().replace(/[^\d.,-]/g, '');
+    if (!s) return 0;
+    const lastComma = s.lastIndexOf(',');
+    const lastDot   = s.lastIndexOf('.');
+    const lastSep   = Math.max(lastComma, lastDot);
+    if (lastSep !== -1) {
+      const digitsAfter = s.length - lastSep - 1;
+      // El último separador es decimal solo si le siguen 1 o 2 dígitos.
+      // Si le siguen 3 (p.ej. "1.000") es separador de miles, no decimal.
+      if (digitsAfter >= 1 && digitsAfter <= 2) {
+        const decSep  = lastComma > lastDot ? ',' : '.';
+        const thouSep = decSep === ',' ? '.' : ',';
+        s = s.split(thouSep).join('');   // elimina separadores de miles
+        s = s.replace(decSep, '.');      // normaliza el decimal a punto
+      } else {
+        s = s.replace(/[.,]/g, '');      // sin decimal: todos son de miles
+      }
+    }
+    const n = parseFloat(s);
     return isNaN(n) ? 0 : Math.round(n * 100);
   },
 
