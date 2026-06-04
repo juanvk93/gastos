@@ -999,12 +999,19 @@ function summaryItem(label, cents, count) {
 /** Card de proyección de fin de mes. Solo aparece si miramos el mes en curso
  *  (en meses pasados los totales ya son definitivos; en meses futuros no hay datos). */
 function buildProjectionCard({ year, month, variableTotal, variableCount, fixedRealTotal, pendingTotal }) {
-  const now = new Date();
-  const isCurrentMonth = (year === now.getFullYear() && month === now.getMonth() + 1);
-  if (!isCurrentMonth) return null;
+  // Solo si miramos el mes contable en curso (depende de payrollDay, no del mes natural).
+  if (ymKey(year, month) !== currentYmKey()) return null;
 
-  const daysInMonth = new Date(year, month, 0).getDate();
-  const elapsed = Math.max(1, Math.min(now.getDate(), daysInMonth));
+  // Límites reales del periodo contable: con payrollDay > 1 el mes no empieza el día 1.
+  const payrollDay = state.payrollDay || 1;
+  const [startISO, endISO] = monthBounds(year, month, payrollDay);
+  const DAY_MS = 86400000;
+  const startDate = new Date(+startISO.slice(0, 4), +startISO.slice(5, 7) - 1, +startISO.slice(8, 10));
+  const endDate   = new Date(+endISO.slice(0, 4),   +endISO.slice(5, 7) - 1,   +endISO.slice(8, 10));
+  const daysInMonth = Math.round((endDate - startDate) / DAY_MS) + 1;
+  const now = new Date();
+  const todayMid = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const elapsed = Math.max(1, Math.min(Math.round((todayMid - startDate) / DAY_MS) + 1, daysInMonth));
   // Bloque fijo del mes: lo ya materializado (real) + lo pendiente de materializar.
   const fixedMonth = (fixedRealTotal || 0) + (pendingTotal || 0);
 
