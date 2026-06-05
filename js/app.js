@@ -2985,6 +2985,17 @@ function openImportCSVModal() {
 
 const CHANGELOG = [
   {
+    version: '1.17',
+    date: 'Junio 2026',
+    items: [
+      'Proyección fin de mes: el contador "Día X de Y" ahora respeta el mes contable. Con día de cobro distinto del 1, cuenta los días desde el inicio real del periodo (ej. con inicio el 27, el 5 de junio muestra "Día 9 de 31" en vez de "Día 4 de 30")',
+      'Donut de "Distribución por categoría": corregidos los artefactos de borde (borde doble en reposo y bordes mal dibujados al pasar el ratón). La separación entre segmentos pasa a ser un hueco transparente, independiente del tema y del fondo',
+      'Corregido bug de zona horaria: la fecha de "hoy" se calculaba en UTC, por lo que en España (UTC+1/+2) entre medianoche y la madrugada los formularios proponían el día anterior. Ahora usa la fecha local',
+      'Botón "Ir al mes actual" del selector de mes: ahora salta al mes CONTABLE en curso. Con día de cobro distinto del 1, en los días finales del mes natural ya no saltaba al periodo equivocado',
+      'Robustez de Informes: si el Web Worker de cálculos falla al cargar o ejecutarse, la vista cae automáticamente al cálculo síncrono en vez de quedarse colgada en "Calculando…"',
+    ],
+  },
+  {
     version: '1.16',
     date: 'Junio 2026',
     items: [
@@ -3386,10 +3397,10 @@ function openMonthPicker() {
     yearPrev.addEventListener('click', () => { pickerYear--; renderGrid(); });
     yearNext.addEventListener('click', () => { pickerYear++; renderGrid(); });
 
-    // Botón "Mes actual"
-    const now = new Date();
-    const todayY = now.getFullYear();
-    const todayM = now.getMonth() + 1;
+    // Botón "Mes actual" — usa el mes CONTABLE en curso (respeta payrollDay).
+    // Con payrollDay > 1, entre el día de cobro y fin de mes natural el periodo
+    // en curso ya es el del mes siguiente; saltar al mes natural sería erróneo.
+    const [todayY, todayM] = currentYmKey().split('-').map(n => parseInt(n, 10));
     if (state.year !== todayY || state.month !== todayM) {
       const todayBtn = el('button', {
         type: 'button',
@@ -3505,12 +3516,28 @@ function computeReportsAsync(year, refMonth) {
   if (useWorker) {
     return new Promise((resolve) => {
       const w = getReportsWorker();
-      const handler = (e) => {
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
         w.removeEventListener('message', handler);
-        if (e.data && e.data.ok) resolve(e.data.result);
-        else resolve(computeReportsSync(payload));
+        w.removeEventListener('error', errHandler);
+        resolve(result);
+      };
+      const handler = (e) => {
+        finish(e.data && e.data.ok ? e.data.result : computeReportsSync(payload));
+      };
+      // Si el worker falla al cargar o lanza fuera del try (evento 'error', no
+      // 'message'), sin esto la promesa quedaría pendiente y la vista Informes
+      // se colgaría en "Calculando…". Caemos al cálculo síncrono y descartamos
+      // el worker para no reintentarlo en cada render.
+      const errHandler = () => {
+        _workerSupported = false;
+        _reportsWorker = null;
+        finish(computeReportsSync(payload));
       };
       w.addEventListener('message', handler);
+      w.addEventListener('error', errHandler);
       w.postMessage(payload);
     });
   }

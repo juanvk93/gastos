@@ -11,9 +11,6 @@ let _donutHovered = null; // índice hovered actualmente (para dim en runtime)
 function _isDark() {
   return document.documentElement.getAttribute('data-theme') === 'dark';
 }
-function _segmentBorder() {
-  return _isDark() ? '#221f1b' : '#faf9f7';
-}
 
 /** Plugin custom: dibuja el % sobre cada segmento con suficiente tamaño. */
 const _datalabelsPlugin = {
@@ -103,15 +100,11 @@ window.DonutChart = {
     // Si el foco apunta a un índice que ya no existe (datos cambiaron), reseteamos.
     if (_donutFocused != null && _donutFocused >= data.length) _donutFocused = null;
 
-    const segmentBorder = _segmentBorder();
-
     if (_donutChart) {
       _donutChart.data.labels = labels;
       _donutChart.data.datasets[0]._baseColors = colors;
       _donutChart.data.datasets[0].data = values;
       _donutChart.data.datasets[0].backgroundColor = colors.slice();
-      _donutChart.data.datasets[0].borderColor = segmentBorder;
-      _donutChart.data.datasets[0].hoverBorderColor = segmentBorder;
       _donutChart.options.plugins.tooltip.callbacks.label = _tooltipCb(pcts);
       _applyDim(_donutChart);
       _donutChart.update();
@@ -126,13 +119,14 @@ window.DonutChart = {
           data: values,
           _baseColors: colors,
           backgroundColor: colors.slice(),
-          borderWidth: 2,
-          borderColor: segmentBorder,
-          hoverBorderColor: segmentBorder,
-          borderRadius: 6,
-          spacing: 1,
-          hoverOffset: 14,
-          borderAlign: 'inner',
+          // Sin borde: la separación entre segmentos se logra con `spacing`
+          // (hueco transparente), que no depende del color de fondo ni del tema.
+          // Un borde con color sólido no casa con el fondo semitransparente de
+          // la card y produce el artefacto de "borde doble".
+          borderWidth: 0,
+          borderRadius: 4,
+          spacing: 3,
+          hoverOffset: 10,
         }],
       },
       options: {
@@ -175,12 +169,11 @@ window.DonutChart = {
     });
   },
 
-  /** Refresca colores dependientes del tema (borde de los segmentos). */
+  /** Refresca el donut al cambiar de tema. La separación entre segmentos es
+   *  transparente (`spacing`), así que no hay colores dependientes del tema;
+   *  se mantiene el hook por si el tooltip u otros props lo necesitan. */
   updateTheme() {
     if (!_donutChart) return;
-    const segmentBorder = _segmentBorder();
-    _donutChart.data.datasets[0].borderColor = segmentBorder;
-    _donutChart.data.datasets[0].hoverBorderColor = segmentBorder;
     _donutChart.update('none');
   },
 

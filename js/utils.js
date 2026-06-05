@@ -39,9 +39,12 @@ window.Utils = {
     return isNaN(n) ? 0 : Math.round(n * 100);
   },
 
-  /** YYYY-MM-DD de hoy */
+  /** YYYY-MM-DD de hoy (en hora LOCAL, no UTC).
+   *  Antes usaba toISOString() —UTC— que en husos por delante de UTC (España
+   *  UTC+1/+2) devolvía el día anterior entre medianoche y las 01:00/02:00. */
   today() {
-    return new Date().toISOString().slice(0, 10);
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   },
 
   /** Nombre completo del mes (1-12) */
