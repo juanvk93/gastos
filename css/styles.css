@@ -1971,6 +1971,94 @@ select.form-input {
   overflow-y: auto;
 }
 
+/* ================================================================
+   Bottom sheet: variante del modal anclada abajo, ~media altura.
+   Pensada para el desglose de categoría sin tapar el donut.
+   ================================================================ */
+.modal.modal--sheet {
+  top: auto;
+  bottom: 0;
+  left: 50%;
+  right: auto;
+  width: 100%;
+  max-width: 720px;                  /* en escritorio no ocupa todo el ancho */
+  height: 52vh;
+  max-height: 52vh;
+  transform: translate(-50%, 100%);  /* oculto: deslizado por debajo */
+  border-radius: 18px 18px 0 0;
+  border-bottom: none;
+}
+.modal.modal--sheet.open {
+  transform: translate(-50%, 0);     /* visible: sube hasta el borde inferior */
+}
+/* Handle superior tipo "agarre" */
+.modal.modal--sheet::before {
+  content: '';
+  flex-shrink: 0;
+  width: 40px;
+  height: 4px;
+  margin: 8px auto 0;
+  border-radius: 2px;
+  background: var(--ink-300);
+}
+
+/* Overlay más suave: deja ver el donut mientras el sheet está abierto. */
+.modal-overlay.modal-overlay--subtle { background: rgba(0,0,0,0.22); }
+[data-theme="dark"] .modal-overlay.modal-overlay--subtle { background: rgba(0,0,0,0.42); }
+
+/* ---- Contenido del desglose por categoría ---- */
+/* El cuerpo es flex column sin scroll: el scroll vive en la lista interior,
+   así la cabecera (nº de gastos + total) queda siempre fija. */
+.cat-sheet-body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.cat-sheet-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+  padding-bottom: 12px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--ink-200);
+}
+.cat-sheet-count { font-size: 0.9rem; color: var(--ink-500); }
+.cat-sheet-total { font-size: 1.4rem; font-weight: 700; color: var(--ink-900); }
+
+.cat-sheet-list {
+  flex: 1 1 auto;
+  min-height: 0;            /* permite que el hijo flex sea scrollable */
+  overflow-y: auto;
+  margin: 0 -4px;           /* compensación visual para el padding del scroll */
+  padding: 0 4px;
+}
+.cat-sheet-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--ink-100);
+}
+.cat-sheet-row:last-child { border-bottom: none; }
+.cat-sheet-info { min-width: 0; }   /* habilita el ellipsis del texto */
+.cat-sheet-desc-line { display: flex; align-items: center; gap: 6px; }
+.cat-sheet-desc {
+  font-weight: 600;
+  color: var(--ink-900);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cat-sheet-amount {
+  font-weight: 700;
+  color: var(--ink-900);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 /* ---- Stats de IndexedDB ---- */
 .db-stats-grid {
   display: grid;

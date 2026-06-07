@@ -849,10 +849,26 @@ function renderDashboard(container) {
   chartWrap.appendChild(centerOverlay);
   leftCol.appendChild(chartWrap);
 
-  // Leyenda interactiva: click sobre un item enfoca/desfoca el segmento.
+  // Leyenda interactiva: click sobre un item resalta su segmento y abre un
+  // bottom sheet con el desglose de los gastos de esa categoría en el mes
+  // contable. Al cerrar el sheet se limpia el resaltado.
   if (chartData.length > 0) {
     const legend = el('div', { class: 'chart-legend' });
     const items = [];
+    const validIds = new Set(state.categories.map(cc => cc.id));
+
+    // Aplica/limpia el resaltado del donut y de los items de la leyenda.
+    function focusLegend(idx) {
+      DonutChart.setFocus(idx);
+      items.forEach((it, i) => {
+        const focused = idx === i;
+        const dimmed  = idx != null && !focused;
+        it.classList.toggle('focused', focused);
+        it.classList.toggle('dimmed', dimmed);
+        it.setAttribute('aria-pressed', focused ? 'true' : 'false');
+      });
+    }
+
     chartData.forEach((c, idx) => {
       const pct = realTotal > 0 ? ((c.totalCents / realTotal) * 100).toFixed(1) : '0.0';
       const nameSpan = el('span', { class: 'legend-name' });
@@ -869,16 +885,13 @@ function renderDashboard(container) {
         el('span', { class: 'legend-pct', text: `${pct}%` }),
       );
       item.addEventListener('click', () => {
-        const current = DonutChart.getFocus();
-        const next = current === idx ? null : idx;
-        DonutChart.setFocus(next);
-        items.forEach((it, i) => {
-          const focused = next === i;
-          const dimmed  = next != null && !focused;
-          it.classList.toggle('focused', focused);
-          it.classList.toggle('dimmed', dimmed);
-          it.setAttribute('aria-pressed', focused ? 'true' : 'false');
-        });
+        focusLegend(idx);
+        // Gastos reales de la categoría en el mes contable mostrado.
+        // '__uncat__' agrupa los gastos cuya categoría ya no existe.
+        const catExpenses = c.id === '__uncat__'
+          ? monthExpenses.filter(e => !validIds.has(e.categoryId))
+          : monthExpenses.filter(e => e.categoryId === c.id);
+        openCategoryBreakdown(c, catExpenses, () => focusLegend(null));
       });
       items.push(item);
       legend.appendChild(item);
@@ -1061,6 +1074,62 @@ function buildProjectionCard({ year, month, variableTotal, variableCount, fixedR
   card.appendChild(help);
 
   return card;
+}
+
+/** Bottom sheet con el desglose de gastos de una categoría en el mes contable.
+ *  @param {{name, color, icon}} cat  categoría (o pseudo "Sin categoría")
+ *  @param {Array} expenses           gastos reales de esa categoría en el periodo
+ *  @param {Function} onClose         se invoca al cerrar (limpia el foco del donut) */
+function openCategoryBreakdown(cat, expenses, onClose) {
+  const total = expenses.reduce((s, e) => s + e.amountCents, 0);
+
+  openModal(cat.name || 'Sin categoría', (body) => {
+    body.classList.add('cat-sheet-body');
+
+    // Cabecera resumen fija (sticky): nº de gastos + total del periodo.
+    const head = el('div', { class: 'cat-sheet-head' });
+    head.appendChild(el('span', {
+      class: 'cat-sheet-count',
+      text: `${expenses.length} gasto${expenses.length !== 1 ? 's' : ''}`,
+    }));
+    head.appendChild(el('span', { class: 'cat-sheet-total mono', text: fmtEUR(total) }));
+    body.appendChild(head);
+
+    if (expenses.length === 0) {
+      body.appendChild(el('div', { class: 'empty-state', text: 'Sin gastos en este periodo' }));
+      return;
+    }
+
+    // Lista scrollable, ordenada por importe descendente.
+    const list = el('div', { class: 'cat-sheet-list' });
+    [...expenses]
+      .sort((a, b) => b.amountCents - a.amountCents)
+      .forEach(e => {
+        const row = el('div', { class: 'cat-sheet-row' });
+        const info = el('div', { class: 'cat-sheet-info' });
+
+        const descLine = el('div', { class: 'cat-sheet-desc-line' });
+        descLine.appendChild(el('span', {
+          class: 'cat-sheet-desc',
+          text: e.description || cat.name || 'Gasto',
+        }));
+        if (e.sourceRecurringId) {
+          descLine.appendChild(el('span', {
+            class: 'expense-recurring-mark',
+            title: 'Generado a partir de un recurrente',
+            'aria-label': 'Recurrente',
+            html: Icons.svg('repeat', 12),
+          }));
+        }
+        info.appendChild(descLine);
+        info.appendChild(el('div', { class: 'expense-meta', text: fmtDate(e.date) }));
+        row.appendChild(info);
+
+        row.appendChild(el('span', { class: 'cat-sheet-amount mono', text: fmtEUR(e.amountCents) }));
+        list.appendChild(row);
+      });
+    body.appendChild(list);
+  }, { variant: 'sheet', onClose });
 }
 
 /* ================================================================
@@ -2985,6 +3054,16 @@ function openImportCSVModal() {
 
 const CHANGELOG = [
   {
+    version: '1.18',
+    date: 'Junio 2026',
+    items: [
+      'Distribución por categoría: al pulsar una categoría en la leyenda se abre un panel deslizante desde abajo (bottom sheet) a media altura con el desglose de sus gastos en el mes contable, sin tapar el donut',
+      'El panel resalta a la vez el segmento correspondiente del donut, y al cerrarlo se limpia el resaltado',
+      'Cabecera fija con el nº de gastos y el total de la categoría; la lista de gastos (ordenada por importe) tiene scroll propio, de modo que aguanta muchos movimientos sin desbordar',
+      'Overlay atenuado y suave en este panel para poder seguir consultando el donut mientras está abierto',
+    ],
+  },
+  {
     version: '1.17',
     date: 'Junio 2026',
     items: [
@@ -3316,18 +3395,43 @@ function closeSidebar() {
    Modal genérico + Modal de novedades
    ================================================================ */
 
-function openModal(titleText, bodyBuilder) {
+// Callback a ejecutar al cerrar el modal actual (p.ej. limpiar el foco del
+// donut cuando se cierra el bottom sheet). Se invoca en cualquier vía de cierre
+// (botón ×, overlay, Escape) y se limpia tras ejecutarse.
+let _modalOnClose = null;
+
+/** Abre el modal genérico.
+ *  options.variant === 'sheet' → bottom sheet a media altura con overlay sutil.
+ *  options.onClose             → callback al cerrar (cualquier vía). */
+function openModal(titleText, bodyBuilder, options = {}) {
+  const modal   = document.getElementById('modal');
+  const overlay = document.getElementById('modal-overlay');
+  const isSheet = options.variant === 'sheet';
+  // toggle (no add): así el siguiente modal no-sheet recupera el estilo centrado.
+  modal.classList.toggle('modal--sheet', isSheet);
+  overlay.classList.toggle('modal-overlay--subtle', isSheet);
+  _modalOnClose = typeof options.onClose === 'function' ? options.onClose : null;
+
   document.getElementById('modal-title').textContent = titleText;
   const body = document.getElementById('modal-body');
+  // Reset de la clase del cuerpo: clear() solo borra hijos, no clases. Sin esto
+  // un modal posterior heredaría 'cat-sheet-body' (flex + overflow:hidden) del sheet.
+  body.className = 'modal-body';
   clear(body);
   bodyBuilder(body);
-  document.getElementById('modal').classList.add('open');
-  document.getElementById('modal-overlay').classList.add('open');
+  modal.classList.add('open');
+  overlay.classList.add('open');
 }
 
 function closeModal() {
   document.getElementById('modal').classList.remove('open');
   document.getElementById('modal-overlay').classList.remove('open');
+  // Las clases de variante (modal--sheet/overlay--subtle) NO se quitan aquí:
+  // mantenerlas durante el fade-out evita que el sheet salte al centro; el
+  // próximo openModal las ajusta vía toggle.
+  const cb = _modalOnClose;
+  _modalOnClose = null;
+  if (cb) cb();
 }
 
 /** Estima el tamaño en bytes de los datos almacenados. */
