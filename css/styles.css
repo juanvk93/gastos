@@ -19,6 +19,9 @@
   --ink-900: #1a1815;
   --accent:  #c47a1a;
   --accent-light: #e5a84b;
+  /* Componentes RGB del acento para usar en rgba(). Se reescribe en runtime
+     (inline en index.html + applyAccent en app.js) al personalizar el color. */
+  --accent-rgb: 196, 122, 26;
   --red:     #c0392b;
   --green:   #27ae60;
   --radius:  14px;
@@ -45,7 +48,7 @@ body {
   color: var(--ink-900);
   background-color: var(--ink-50);
   background-image:
-    radial-gradient(ellipse at 20% -5%, rgba(196,122,26,0.07) 0%, transparent 50%),
+    radial-gradient(ellipse at 20% -5%, rgba(var(--accent-rgb),0.07) 0%, transparent 50%),
     radial-gradient(ellipse at 90% 100%, rgba(26,24,21,0.04) 0%, transparent 50%);
   background-attachment: fixed;
   min-height: 100vh;
@@ -426,7 +429,7 @@ h1, h2, h3 { font-family: var(--font-display); letter-spacing: -0.025em; font-we
 
 .form-input:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(196,122,26,0.15);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb),0.15);
 }
 
 .form-input::placeholder { color: var(--ink-300); }
@@ -798,8 +801,8 @@ select.form-input {
 }
 
 .badge-recurring  { background: rgba(39,174,96,0.10); color: var(--green); }
-.badge-annual     { background: rgba(196,122,26,0.12); color: var(--accent); }
-.badge-annualized { background: rgba(196,122,26,0.12); color: var(--accent); }
+.badge-annual     { background: rgba(var(--accent-rgb),0.12); color: var(--accent); }
+.badge-annualized { background: rgba(var(--accent-rgb),0.12); color: var(--accent); }
 .badge-yearly     { background: rgba(192,57,43,0.10);  color: var(--red); }
 .badge            { background: var(--ink-100); color: var(--ink-500); }
 
@@ -1162,7 +1165,7 @@ select.form-input {
   align-items: center;
   justify-content: center;
 }
-.btn-edit:hover { color: var(--accent); background: rgba(196,122,26,0.08); }
+.btn-edit:hover { color: var(--accent); background: rgba(var(--accent-rgb),0.08); }
 .expense-row:hover .btn-edit { opacity: 1; }
 /* En filas de recurrentes el botón Editar es siempre visible (la fila no tiene tap target alternativo) */
 .recurring-row .btn-edit { opacity: 0.7; }
@@ -1172,7 +1175,7 @@ select.form-input {
 /* Botón pausar/activar de recurrente: comparte estilo con .btn-edit pero
    colorea distinto en hover según esté activo (verde→pausar) o pausado (ámbar→reanudar). */
 .recurring-row .btn-toggle:hover { color: var(--green); background: rgba(39,174,96,0.10); }
-.recurring-row.inactive .btn-toggle:hover { color: var(--accent); background: rgba(196,122,26,0.10); }
+.recurring-row.inactive .btn-toggle:hover { color: var(--accent); background: rgba(var(--accent-rgb),0.10); }
 
 .expense-row--editing {
   flex-direction: column;
@@ -1289,7 +1292,7 @@ select.form-input {
 
 [data-theme="dark"] body {
   background-image:
-    radial-gradient(ellipse at 20% -5%, rgba(196,122,26,0.12) 0%, transparent 50%),
+    radial-gradient(ellipse at 20% -5%, rgba(var(--accent-rgb),0.12) 0%, transparent 50%),
     radial-gradient(ellipse at 90% 100%, rgba(0,0,0,0.2) 0%, transparent 50%);
 }
 
@@ -2527,7 +2530,7 @@ button.month-nav-text:hover { background: var(--ink-100); }
   display: none; /* Solo se muestra en móvil */
   align-items: center;
   justify-content: center;
-  box-shadow: 0 4px 14px rgba(196,122,26,0.4), 0 2px 4px rgba(0,0,0,0.15);
+  box-shadow: 0 4px 14px rgba(var(--accent-rgb),0.4), 0 2px 4px rgba(0,0,0,0.15);
   transition: transform 0.18s cubic-bezier(.4,0,.2,1), background 0.15s;
   padding: 0;
 }
@@ -3135,5 +3138,234 @@ button.month-nav-text:hover { background: var(--ink-100); }
 @media (max-width: 600px) {
   .yoy-row { grid-template-columns: 1fr 56px; gap: 4px 10px; }
   .yoy-compare { grid-column: 1 / -1; font-size: 0.78rem; }
+}
+
+/* =============================================================
+   Vista: Ajustes
+   ============================================================= */
+
+.settings-wrap {
+  max-width: 640px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.settings-card-desc {
+  font-size: 0.85rem;
+  color: var(--ink-500);
+  margin: -2px 0 16px;
+  line-height: 1.45;
+}
+
+/* Fila genérica etiqueta + control */
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 0;
+  border-top: 1px solid var(--ink-200);
+}
+.settings-row:first-of-type { border-top: none; }
+.settings-row-text { min-width: 0; }
+.settings-row-label {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--ink-900);
+}
+.settings-row-hint {
+  font-size: 0.8rem;
+  color: var(--ink-500);
+  margin-top: 2px;
+}
+
+/* Bloque de color de acento */
+.settings-accent-block {
+  padding-top: 14px;
+  border-top: 1px solid var(--ink-200);
+}
+.accent-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 10px;
+  align-items: center;
+}
+.accent-swatch {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  background: var(--sw, #ccc);
+  cursor: pointer;
+  padding: 0;
+  position: relative;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.08) inset;
+}
+.accent-swatch:hover { transform: scale(1.08); }
+.accent-swatch:focus-visible { outline: 2px solid var(--ink-900); outline-offset: 2px; }
+.accent-swatch.selected {
+  border-color: var(--ink-50);
+  box-shadow: 0 0 0 2px var(--sw, #ccc);
+}
+.accent-swatch.selected::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 11px;
+  height: 6px;
+  border-left: 2.5px solid #fff;
+  border-bottom: 2.5px solid #fff;
+  transform: translateY(-1px) rotate(-45deg);
+}
+
+/* Swatch personalizado: input color nativo dentro de un botón redondo */
+.accent-swatch-custom {
+  position: relative;
+  overflow: hidden;
+  background:
+    conic-gradient(from 0deg,
+      #c0395a, #c25a35, #c47a1a, #5a9c3f,
+      #1a9c8f, #3f6fc4, #7c5cc4, #a8408c, #c0395a);
+}
+.accent-swatch-custom .accent-custom-input {
+  position: absolute;
+  inset: -4px;
+  width: calc(100% + 8px);
+  height: calc(100% + 8px);
+  opacity: 0;
+  cursor: pointer;
+  border: none;
+  padding: 0;
+}
+.accent-swatch-custom .accent-custom-ico {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  pointer-events: none;
+  filter: drop-shadow(0 1px 1px rgba(0,0,0,0.35));
+}
+.accent-swatch-custom.selected::after { display: none; }
+
+.accent-preview {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+  padding: 14px;
+  border-radius: var(--radius-sm);
+  background: var(--ink-100);
+}
+.accent-preview-solid {
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+}
+.accent-preview-badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(var(--accent-rgb),0.12);
+  color: var(--accent);
+}
+.accent-swatch-custom.selected {
+  border-color: var(--ink-50);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.accent-preview-link {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--accent);
+}
+.accent-preview-name {
+  margin-left: auto;
+  font-size: 0.8rem;
+  color: var(--ink-500);
+  font-family: var(--font-mono);
+}
+
+/* Sección de Datos */
+.settings-data-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 4px;
+}
+.settings-data-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  background: var(--ink-100);
+  border: 1px solid var(--ink-200);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--ink-900);
+  padding: 12px 14px;
+  transition: border-color 0.15s, background 0.15s, transform 0.08s;
+}
+.settings-data-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.settings-data-btn:active { transform: translateY(1px); }
+.settings-data-btn .settings-data-ico {
+  display: flex;
+  flex-shrink: 0;
+  color: var(--ink-500);
+}
+.settings-data-btn:hover .settings-data-ico { color: var(--accent); }
+.settings-data-sub {
+  display: block;
+  font-size: 0.74rem;
+  font-weight: 500;
+  color: var(--ink-500);
+  margin-top: 1px;
+}
+
+@media (max-width: 520px) {
+  .settings-data-grid { grid-template-columns: 1fr; }
+}
+
+/* Almacenamiento */
+.storage-badge {
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 999px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.storage-badge.ok {
+  background: rgba(39,174,96,0.14);
+  color: var(--green);
+}
+.storage-meter {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--ink-200);
+  overflow: hidden;
+  margin-top: 8px;
+}
+.storage-meter-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.4s ease;
 }
 

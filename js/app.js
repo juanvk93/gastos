@@ -36,6 +36,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   await materializeRecurrings();
   await reload();
   bindGlobalEvents();
+  // Solicita almacenamiento persistente para que el navegador no borre los datos
+  // por falta de espacio o de uso. No bloquea el arranque (fire-and-forget).
+  requestPersistentStorage();
 });
 
 async function reload() {
@@ -82,10 +85,7 @@ function bindGlobalEvents() {
   updateThemeIcon(savedTheme);
   document.getElementById('btn-theme').addEventListener('click', () => {
     const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-    document.documentElement.setAttribute('data-theme', next);
-    localStorage.setItem('theme', next);
-    updateThemeIcon(next);
-    if (window.DonutChart && DonutChart.updateTheme) DonutChart.updateTheme();
+    setTheme(next);
   });
 
   // Sidebar
@@ -123,6 +123,120 @@ function bindGlobalEvents() {
 function updateThemeIcon(theme) {
   const btn = document.getElementById('btn-theme');
   if (btn) btn.innerHTML = Icons.svg(theme === 'dark' ? 'sun' : 'moon', 16);
+}
+
+/** Aplica un tema ('dark'|'light'), lo persiste y sincroniza todos los controles
+ *  de tema visibles (botón del header + toggle de Ajustes). Punto único de cambio. */
+function setTheme(next) {
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  updateThemeIcon(next);
+  if (window.DonutChart && DonutChart.updateTheme) DonutChart.updateTheme();
+  document.querySelectorAll('[data-theme-toggle]').forEach(chk => { chk.checked = next === 'dark'; });
+}
+
+/* ================================================================
+   Color de acento (personalización del usuario)
+   ================================================================ */
+
+const DEFAULT_ACCENT = { accent: '#c47a1a', light: '#e5a84b', rgb: '196, 122, 26' };
+
+// Paleta de presets. Cada uno define el tono principal y su variante clara
+// (hover/gradientes). El componente RGB se calcula al vuelo desde `accent`.
+const ACCENT_PRESETS = [
+  { name: 'Naranja',   accent: '#c47a1a', light: '#e5a84b' },
+  { name: 'Terracota', accent: '#c25a35', light: '#e08a64' },
+  { name: 'Carmín',    accent: '#c0395a', light: '#e06a86' },
+  { name: 'Magenta',   accent: '#a8408c', light: '#cd6fb4' },
+  { name: 'Violeta',   accent: '#7c5cc4', light: '#a488e0' },
+  { name: 'Azul',      accent: '#3f6fc4', light: '#6f97e0' },
+  { name: 'Verde mar', accent: '#1a9c8f', light: '#45c2b4' },
+  { name: 'Verde',     accent: '#5a9c3f', light: '#84c266' },
+];
+
+/** '#rrggbb' (o '#rgb') → [r, g, b]. */
+function hexToRgbTriple(hex) {
+  let h = String(hex || '').trim().replace('#', '');
+  if (h.length === 3) h = h.split('').map(c => c + c).join('');
+  if (!/^[0-9a-fA-F]{6}$/.test(h)) return [196, 122, 26];
+  const n = parseInt(h, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+/** Aclara un hex mezclándolo hacia el blanco (amt ∈ 0..1). */
+function lightenHex(hex, amt) {
+  const [r, g, b] = hexToRgbTriple(hex);
+  const mix = c => Math.round(c + (255 - c) * amt);
+  const to2 = c => c.toString(16).padStart(2, '0');
+  return '#' + to2(mix(r)) + to2(mix(g)) + to2(mix(b));
+}
+
+/** Normaliza una entrada (preset o hex) a un objeto de acento completo. */
+function buildAccent(hex, lightOverride) {
+  const accent = hex || DEFAULT_ACCENT.accent;
+  const [r, g, b] = hexToRgbTriple(accent);
+  return {
+    accent,
+    light: lightOverride || lightenHex(accent, 0.32),
+    rgb: `${r}, ${g}, ${b}`,
+  };
+}
+
+/** Escribe las variables CSS del acento en :root (vía estilo inline). */
+function applyAccent(ac) {
+  const r = document.documentElement.style;
+  r.setProperty('--accent', ac.accent);
+  r.setProperty('--accent-light', ac.light);
+  r.setProperty('--accent-rgb', ac.rgb);
+}
+
+/** Persiste y aplica el acento. */
+function saveAccent(ac) {
+  applyAccent(ac);
+  localStorage.setItem('accent-color', JSON.stringify(ac));
+}
+
+/** Lee el acento guardado (o el por defecto si no hay/es inválido). */
+function loadAccent() {
+  try {
+    const ac = JSON.parse(localStorage.getItem('accent-color'));
+    if (ac && ac.accent) return ac;
+  } catch (e) { /* sin localStorage o JSON inválido */ }
+  return { ...DEFAULT_ACCENT };
+}
+
+/* ================================================================
+   Persistencia del almacenamiento
+   Por defecto, IndexedDB es "best-effort": el navegador puede borrarla
+   bajo presión de espacio o tras una inactividad prolongada. Solicitar
+   almacenamiento PERSISTENTE evita ese desalojo automático.
+   ================================================================ */
+
+/** Pide al navegador que marque el almacenamiento como persistente.
+ *  Devuelve true (concedido), false (denegado) o null (no soportado). */
+async function requestPersistentStorage() {
+  if (!navigator.storage || !navigator.storage.persist) return null;
+  try {
+    if (navigator.storage.persisted && await navigator.storage.persisted()) return true;
+    return await navigator.storage.persist();
+  } catch (e) {
+    return null;
+  }
+}
+
+/** Estado actual del almacenamiento: persistencia + uso/cuota estimados. */
+async function getStorageInfo() {
+  const info = { persisted: null, usage: null, quota: null };
+  if (!navigator.storage) return info;
+  try { if (navigator.storage.persisted) info.persisted = await navigator.storage.persisted(); } catch (e) { /* */ }
+  try {
+    if (navigator.storage.estimate) {
+      const est = await navigator.storage.estimate();
+      info.usage = est.usage;
+      info.quota = est.quota;
+    }
+  } catch (e) { /* */ }
+  return info;
 }
 
 /* ================================================================
@@ -694,11 +808,12 @@ function render() {
     case 'savings':    renderSavings(main); break;
     case 'categories': renderCategories(main); break;
     case 'accounting': renderAccountingMonth(main); break;
+    case 'settings':   renderSettings(main); break;
   }
 
-  // FAB visible solo si la app está lista (no en vista categories donde estorba)
+  // FAB visible solo si la app está lista (no en vistas de configuración donde estorba)
   const fab = document.getElementById('btn-quick-add');
-  if (fab) fab.classList.toggle('hidden', state.view === 'categories');
+  if (fab) fab.classList.toggle('hidden', state.view === 'categories' || state.view === 'settings');
 }
 
 /* ---- Idle scheduling helper ---- */
@@ -2134,6 +2249,219 @@ function wrap(labelText, input) {
    ================================================================ */
 
 /* ================================================================
+   Vista: Ajustes (hub: apariencia, color de acento y datos)
+   ================================================================ */
+
+function renderSettings(container) {
+  const wrap = el('div', { class: 'settings-wrap' });
+
+  /* ---------- Card: Apariencia ---------- */
+  const appearance = el('div', { class: 'card' });
+  appearance.appendChild(el('h2', { class: 'card-title', text: 'Apariencia' }));
+  appearance.appendChild(el('p', {
+    class: 'settings-card-desc',
+    text: 'Personaliza el aspecto de la aplicación. Estos ajustes se guardan en este dispositivo.',
+  }));
+
+  // -- Fila: tema oscuro --
+  const themeRow = el('div', { class: 'settings-row' });
+  const themeText = el('div', { class: 'settings-row-text' });
+  themeText.appendChild(el('div', { class: 'settings-row-label', text: 'Tema oscuro' }));
+  themeText.appendChild(el('div', { class: 'settings-row-hint', text: 'Alterna entre el tema claro y el oscuro.' }));
+  themeRow.appendChild(themeText);
+
+  const themeToggle = el('label', { class: 'sidebar-toggle' });
+  const themeChk = el('input', { type: 'checkbox' });
+  themeChk.setAttribute('data-theme-toggle', '');
+  themeChk.checked = document.documentElement.getAttribute('data-theme') === 'dark';
+  themeChk.addEventListener('change', () => setTheme(themeChk.checked ? 'dark' : 'light'));
+  themeToggle.appendChild(themeChk);
+  themeToggle.appendChild(el('span', { class: 'sidebar-toggle-slider' }));
+  themeRow.appendChild(themeToggle);
+  appearance.appendChild(themeRow);
+
+  // -- Bloque: color de acento --
+  const accentBlock = el('div', { class: 'settings-accent-block' });
+  accentBlock.appendChild(el('div', { class: 'settings-row-label', text: 'Color de acento' }));
+  accentBlock.appendChild(el('div', {
+    class: 'settings-row-hint',
+    text: 'El color principal de resaltados, enlaces, etiquetas y el botón de añadir.',
+  }));
+
+  const current = loadAccent();
+  const swatches = el('div', { class: 'accent-swatches' });
+
+  // Vista previa en vivo (los elementos heredan las variables CSS del acento).
+  const preview = el('div', { class: 'accent-preview' });
+  preview.appendChild(el('span', { class: 'accent-preview-solid', text: 'Resaltado' }));
+  preview.appendChild(el('span', { class: 'accent-preview-badge', text: 'Etiqueta' }));
+  preview.appendChild(el('span', { class: 'accent-preview-link', text: 'Enlace' }));
+  const pvName = el('span', { class: 'accent-preview-name' });
+  preview.appendChild(pvName);
+
+  // Swatch personalizado (input color nativo, declarado antes para los helpers).
+  const customSw = el('label', { class: 'accent-swatch accent-swatch-custom', title: 'Color personalizado' });
+  const customInput = el('input', { type: 'color', class: 'accent-custom-input', value: current.accent });
+  customSw.appendChild(customInput);
+  customSw.appendChild(el('span', { class: 'accent-custom-ico', html: Icons.svg('plus', 16) }));
+
+  function markSelected(hex) {
+    const lc = String(hex || '').toLowerCase();
+    let matchedPreset = false;
+    swatches.querySelectorAll('.accent-swatch:not(.accent-swatch-custom)').forEach(s => {
+      const on = (s.dataset.accent || '').toLowerCase() === lc;
+      s.classList.toggle('selected', on);
+      if (on) matchedPreset = true;
+    });
+    // Sin preset coincidente → el color es personalizado: resalta ese swatch.
+    customSw.classList.toggle('selected', !matchedPreset);
+    customSw.style.setProperty('--sw', hex);
+    if (!matchedPreset) customInput.value = hex;
+  }
+
+  function refreshName(ac) {
+    const preset = ACCENT_PRESETS.find(p => p.accent.toLowerCase() === ac.accent.toLowerCase());
+    pvName.textContent = preset ? preset.name : ac.accent.toUpperCase();
+  }
+
+  function choose(ac) {
+    saveAccent(ac);
+    markSelected(ac.accent);
+    refreshName(ac);
+  }
+
+  // Swatches de la paleta.
+  ACCENT_PRESETS.forEach(p => {
+    const sw = el('button', { type: 'button', class: 'accent-swatch', title: p.name });
+    sw.style.setProperty('--sw', p.accent);
+    sw.dataset.accent = p.accent;
+    sw.addEventListener('click', () => choose(buildAccent(p.accent, p.light)));
+    swatches.appendChild(sw);
+  });
+
+  // El swatch personalizado va al final.
+  customInput.addEventListener('input', () => choose(buildAccent(customInput.value)));
+  swatches.appendChild(customSw);
+
+  accentBlock.appendChild(swatches);
+  accentBlock.appendChild(preview);
+  appearance.appendChild(accentBlock);
+  wrap.appendChild(appearance);
+
+  // Estado inicial.
+  markSelected(current.accent);
+  refreshName(current);
+
+  /* ---------- Card: Almacenamiento ---------- */
+  const storage = el('div', { class: 'card' });
+  storage.appendChild(el('h2', { class: 'card-title', text: 'Almacenamiento' }));
+  storage.appendChild(el('p', {
+    class: 'settings-card-desc',
+    text: 'Tus datos se guardan únicamente en este navegador. Con el almacenamiento persistente activado, el navegador no los borrará por falta de espacio ni por inactividad.',
+  }));
+  const storageBody = el('div', {});
+  storage.appendChild(storageBody);
+  wrap.appendChild(storage);
+  populateStorageCard(storageBody);   // asíncrono: rellena el estado real
+
+  /* ---------- Card: Datos ---------- */
+  const data = el('div', { class: 'card' });
+  data.appendChild(el('h2', { class: 'card-title', text: 'Datos' }));
+  data.appendChild(el('p', {
+    class: 'settings-card-desc',
+    text: 'Crea una copia de seguridad de tus datos o restáuralos. La importación CSV permite cargar movimientos desde tu banco.',
+  }));
+
+  const grid = el('div', { class: 'settings-data-grid' });
+
+  function dataBtn(icon, label, sub, onClick) {
+    const btn = el('button', { type: 'button', class: 'settings-data-btn', onClick });
+    btn.appendChild(el('span', { class: 'settings-data-ico', html: Icons.svg(icon, 20) }));
+    const txt = el('span', {});
+    txt.appendChild(el('span', { text: label }));
+    txt.appendChild(el('span', { class: 'settings-data-sub', text: sub }));
+    btn.appendChild(txt);
+    return btn;
+  }
+
+  grid.appendChild(dataBtn('download', 'Exportar JSON', 'Copia de seguridad completa', () => exportJSON()));
+  grid.appendChild(dataBtn('download', 'Exportar CSV',  'Gastos en hoja de cálculo',   () => exportCSV()));
+  grid.appendChild(dataBtn('upload',   'Importar JSON', 'Restaurar una copia',         () => openImportJSONModal()));
+  grid.appendChild(dataBtn('upload',   'Importar CSV',  'Cargar movimientos del banco', () => openImportCSVModal()));
+  data.appendChild(grid);
+  wrap.appendChild(data);
+
+  container.appendChild(wrap);
+}
+
+/** Rellena (de forma asíncrona) el cuerpo de la tarjeta de Almacenamiento con
+ *  el estado de persistencia y el uso estimado. Se puede re-invocar para refrescar. */
+async function populateStorageCard(host) {
+  const info = await getStorageInfo();
+  // La vista pudo cambiar mientras se resolvía la promesa.
+  if (!host.isConnected) return;
+  clear(host);
+
+  if (info.persisted === null) {
+    host.appendChild(el('div', {
+      class: 'settings-row-hint',
+      text: 'Este navegador no permite consultar ni fijar la persistencia del almacenamiento. Te recomendamos exportar copias de seguridad periódicas.',
+    }));
+    return;
+  }
+
+  // Fila: estado de persistencia + acción.
+  const row = el('div', { class: 'settings-row' });
+  const txt = el('div', { class: 'settings-row-text' });
+  txt.appendChild(el('div', { class: 'settings-row-label', text: 'Almacenamiento persistente' }));
+  txt.appendChild(el('div', {
+    class: 'settings-row-hint',
+    text: info.persisted
+      ? 'Activado. El navegador no borrará tus datos automáticamente.'
+      : 'No activado. El navegador podría borrar tus datos si necesita espacio.',
+  }));
+  row.appendChild(txt);
+
+  if (info.persisted) {
+    row.appendChild(el('span', { class: 'storage-badge ok', text: '✓ Activado' }));
+  } else {
+    const btn = el('button', { type: 'button', class: 'btn btn-primary', text: 'Activar' });
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      btn.textContent = 'Activando…';
+      const ok = await requestPersistentStorage();
+      // En algunos navegadores (Chrome) persist() puede devolver false sin preguntar:
+      // la concesión depende del "engagement" (PWA instalada, uso frecuente, etc.).
+      if (ok === false) {
+        alert('El navegador todavía no ha concedido el almacenamiento persistente. '
+          + 'Suele concederse al instalar la app en el dispositivo o tras usarla con frecuencia.\n\n'
+          + 'Tus datos siguen guardados; mientras tanto, conviene hacer copias de seguridad (Exportar JSON).');
+      }
+      populateStorageCard(host);   // refresca el estado
+    });
+    row.appendChild(btn);
+  }
+  host.appendChild(row);
+
+  // Fila: uso estimado (si el navegador lo expone).
+  if (typeof info.usage === 'number' && typeof info.quota === 'number' && info.quota > 0) {
+    const pct = Math.min(100, Math.max(0, (info.usage / info.quota) * 100));
+    const usageRow = el('div', { class: 'settings-row' });
+    const uTxt = el('div', { class: 'settings-row-text', style: { width: '100%' } });
+    uTxt.appendChild(el('div', { class: 'settings-row-label', text: 'Espacio utilizado' }));
+    uTxt.appendChild(el('div', {
+      class: 'settings-row-hint',
+      text: `${fmtBytes(info.usage)} de ${fmtBytes(info.quota)} disponibles`,
+    }));
+    const meter = el('div', { class: 'storage-meter' });
+    meter.appendChild(el('div', { class: 'storage-meter-fill', style: { width: `${pct}%` } }));
+    uTxt.appendChild(meter);
+    usageRow.appendChild(uTxt);
+    host.appendChild(usageRow);
+  }
+}
+
+/* ================================================================
    Vista: Mes contable (configuración del payrollDay)
    ================================================================ */
 
@@ -3054,6 +3382,17 @@ function openImportCSVModal() {
 
 const CHANGELOG = [
   {
+    version: '1.19',
+    date: 'Junio 2026',
+    items: [
+      'Nueva vista «Ajustes» (en Configuración) que reúne la apariencia y los datos en un único sitio',
+      'Color de acento personalizable: elige entre 8 colores de la paleta o cualquier color con el selector libre. Antes solo era naranja; ahora cada quien lo adapta a su gusto, con vista previa en vivo',
+      'El interruptor de tema oscuro y las acciones de exportar/importar (JSON y CSV) se han trasladado del menú lateral a la vista de Ajustes; el menú lateral queda más limpio',
+      'La preferencia de color se guarda en el dispositivo y se aplica al instante al abrir la app, sin parpadeos',
+      'Almacenamiento persistente: la app solicita al navegador que NO borre tus datos por falta de espacio o de uso. La nueva sección «Almacenamiento» (en Ajustes) muestra el estado, permite activarlo y muestra el espacio utilizado',
+    ],
+  },
+  {
     version: '1.18',
     date: 'Junio 2026',
     items: [
@@ -3275,6 +3614,7 @@ const CONFIG_TABS = [
   { id: 'recurring',  label: 'Recurrentes' },
   { id: 'categories', label: 'Categorías' },
   { id: 'accounting', label: 'Mes contable' },
+  { id: 'settings',   label: 'Ajustes' },
 ];
 
 const TAB_DEFS = [...MAIN_TABS, ...CONFIG_TABS];
@@ -3321,53 +3661,11 @@ function buildSidebar() {
   body.appendChild(secNav);
 
   // ---- Sección: Configuración ----
+  // (Apariencia, color de acento y Datos viven ahora dentro de la vista «Ajustes».)
   const secConfig = el('div', { class: 'sidebar-section' });
   secConfig.appendChild(el('div', { class: 'sidebar-section-title', text: 'Configuración' }));
   CONFIG_TABS.forEach(tab => secConfig.appendChild(navBtn(tab)));
   body.appendChild(secConfig);
-
-  // ---- Sección: Apariencia ----
-  const secTheme = el('div', { class: 'sidebar-section' });
-  secTheme.appendChild(el('div', { class: 'sidebar-section-title', text: 'Apariencia' }));
-
-  const themeRow = el('div', { class: 'sidebar-row sidebar-theme-row' });
-  themeRow.appendChild(el('span', { class: 'sidebar-row-label', text: 'Tema oscuro' }));
-  const toggle = el('label', { class: 'sidebar-toggle' });
-  const chk = el('input', { type: 'checkbox' });
-  chk.checked = document.documentElement.getAttribute('data-theme') === 'dark';
-  const slider = el('span', { class: 'sidebar-toggle-slider' });
-  toggle.appendChild(chk);
-  toggle.appendChild(slider);
-  themeRow.appendChild(toggle);
-  secTheme.appendChild(themeRow);
-
-  chk.addEventListener('change', () => {
-    const next = chk.checked ? 'dark' : 'light';
-    document.documentElement.setAttribute('data-theme', next);
-    localStorage.setItem('theme', next);
-    updateThemeIcon(next);
-    if (window.DonutChart && DonutChart.updateTheme) DonutChart.updateTheme();
-  });
-
-  body.appendChild(secTheme);
-
-  // ---- Sección: Datos ----
-  const secData = el('div', { class: 'sidebar-section' });
-  secData.appendChild(el('div', { class: 'sidebar-section-title', text: 'Datos' }));
-
-  function dataBtn(arrow, label, onClick) {
-    const btn = el('button', { class: 'sidebar-action-btn' });
-    btn.appendChild(el('span', { class: 'sidebar-action-arrow', text: arrow }));
-    btn.appendChild(el('span', { text: label }));
-    btn.addEventListener('click', onClick);
-    return btn;
-  }
-
-  secData.appendChild(dataBtn('↑', 'Exportar JSON', () => { exportJSON(); closeSidebar(); }));
-  secData.appendChild(dataBtn('↑', 'Exportar CSV', () => { exportCSV();  closeSidebar(); }));
-  secData.appendChild(dataBtn('↓', 'Importar JSON', () => { closeSidebar(); openImportJSONModal(); }));
-  secData.appendChild(dataBtn('↓', 'Importar CSV',  () => { closeSidebar(); openImportCSVModal();  }));
-  body.appendChild(secData);
 
   // ---- Sección: Información ----
   const secInfo = el('div', { class: 'sidebar-section' });
@@ -3451,9 +3749,13 @@ function estimateDataBytes() {
 }
 
 function fmtBytes(bytes) {
+  if (typeof bytes !== 'number' || !isFinite(bytes)) return '—';
   if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = bytes / 1024, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  // 1 decimal para valores pequeños, sin decimales a partir de 10. Separador es-ES.
+  return `${v.toFixed(v < 10 ? 1 : 0).replace('.', ',')} ${units[i]}`;
 }
 
 function openMonthPicker() {

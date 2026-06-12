@@ -12,8 +12,21 @@
   <link rel="icon" href="icons/icon-192.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="icons/icon-192.svg" />
 
-  <!-- Tema: aplicar antes de renderizar para evitar flash -->
-  <script>document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'dark');</script>
+  <!-- Tema y color de acento: aplicar antes de renderizar para evitar flash -->
+  <script>
+    (function () {
+      var root = document.documentElement;
+      root.setAttribute('data-theme', localStorage.getItem('theme') || 'dark');
+      try {
+        var ac = JSON.parse(localStorage.getItem('accent-color'));
+        if (ac && ac.accent) {
+          root.style.setProperty('--accent', ac.accent);
+          root.style.setProperty('--accent-light', ac.light || ac.accent);
+          root.style.setProperty('--accent-rgb', ac.rgb || '196, 122, 26');
+        }
+      } catch (e) { /* localStorage no disponible o JSON inválido: usa el acento por defecto */ }
+    })();
+  </script>
 
   <!-- Estilos -->
   <link rel="stylesheet" href="css/styles.css" />
