@@ -42,6 +42,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   await migrateIncomeToEntries();
   await materializeRecurrings();
   await materializeRecurringIncome();
+  // Posiciona el periodo inicial en el MES CONTABLE en curso (depende de payrollDay).
+  // El estado arranca con el mes natural; con día de cobro > 1, entre ese día y fin
+  // de mes el periodo en curso ya es el del mes siguiente (ej. el 27 con día 25 → julio).
+  await initCurrentAccountingPeriod();
   await reload();
   bindGlobalEvents();
   // Solicita almacenamiento persistente para que el navegador no borre los datos
@@ -74,6 +78,19 @@ async function reload() {
     if (i.recurringInstanceKey) state.incomeMaterializedKeys.add(i.recurringInstanceKey);
   }
   render();
+}
+
+/** Sitúa el periodo (year, month) en el MES CONTABLE en curso al arrancar.
+ *  El estado nace con el mes natural; con payrollDay = 1 coincide con el contable,
+ *  pero con payrollDay > 1, entre el día de cobro y fin de mes natural el periodo
+ *  vigente es el del mes siguiente. Solo se invoca una vez, en el arranque. */
+async function initCurrentAccountingPeriod() {
+  const payrollEntry = await DB.getSetting('payroll-day');
+  const pd = payrollEntry?.value;
+  state.payrollDay = (typeof pd === 'number' && pd >= 1 && pd <= 28) ? pd : 1;
+  const [y, m] = currentYmKey().split('-').map(n => parseInt(n, 10));
+  state.year = y;
+  state.month = m;
 }
 
 /* ================================================================
@@ -3892,6 +3909,7 @@ const CHANGELOG = [
       'Los ingresos respetan el día de nómina (mes contable), igual que los gastos: ingresos, gastos y ahorro quedan siempre dentro del mismo periodo',
       'La proyección de ahorro ahora también suma los ingresos recurrentes pendientes, además de restar los gastos pendientes',
       'Migración automática: tu ingreso mensual anterior se convierte en una línea por mes, sin pérdida de histórico. Los backups antiguos se siguen importando',
+      'Corregido: al abrir la app, el periodo inicial respeta el día de cobro. Con día de cobro distinto del 1, en los días finales del mes natural ya se muestra el mes contable en curso (ej. el 27 con día 25 abre Julio, no Junio)',
     ],
   },
   {
