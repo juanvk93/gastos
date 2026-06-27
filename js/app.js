@@ -13,13 +13,16 @@ let state = {
   categories: [],
   expenses: [],
   recurring: [],
-  income: [],
+  income: [],            // líneas de ingreso con fecha (store `incomes`, v5)
+  incomeCategories: [],  // catálogo de fuentes de ingreso
+  recurringIncome: [],   // plantillas de ingreso recurrente
   annualGoal: 0,
   tagFilter: null,
   view: 'dashboard',
-  // Set de recurringInstanceKey ya materializadas. Se reconstruye en cada reload
-  // y es consultado por getPendingForPeriod() y otros helpers en O(1).
+  // Sets de recurringInstanceKey ya materializadas (gasto / ingreso). Se
+  // reconstruyen en cada reload y los consultan los helpers getPending* en O(1).
   materializedKeys: new Set(),
+  incomeMaterializedKeys: new Set(),
   // Día (1-28) en el que empieza el mes contable. 1 = mes natural (default).
   // El mes contable lleva el nombre del mes en que TERMINA (convención bancaria):
   // payrollDay=25 → "Mayo 2026" = 25-abril → 24-mayo.
@@ -33,7 +36,12 @@ let state = {
 document.addEventListener('DOMContentLoaded', async () => {
   await DB.open();
   await DB.seedCategories();
+  await DB.seedIncomeCategories();
+  // Convierte el agregado mensual antiguo (income 'YYYY-MM') en líneas (incomes).
+  // Idempotente: solo se ejecuta una vez (flag en settings).
+  await migrateIncomeToEntries();
   await materializeRecurrings();
+  await materializeRecurringIncome();
   await reload();
   bindGlobalEvents();
   // Solicita almacenamiento persistente para que el navegador no borre los datos
@@ -42,8 +50,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 async function reload() {
-  [state.categories, state.expenses, state.recurring, state.income] = await Promise.all([
-    DB.getCategories(), DB.getExpenses(), DB.getRecurring(), DB.getAllIncome(),
+  [
+    state.categories, state.expenses, state.recurring,
+    state.income, state.incomeCategories, state.recurringIncome,
+  ] = await Promise.all([
+    DB.getCategories(), DB.getExpenses(), DB.getRecurring(),
+    DB.getIncomeEntries(), DB.getIncomeCategories(), DB.getRecurringIncome(),
   ]);
   const [goalEntry, payrollEntry] = await Promise.all([
     DB.getSetting('annual-goal'),
@@ -52,12 +64,60 @@ async function reload() {
   state.annualGoal = goalEntry?.value || 0;
   const pd = payrollEntry?.value;
   state.payrollDay = (typeof pd === 'number' && pd >= 1 && pd <= 28) ? pd : 1;
-  // Reconstruye el set de instanceKeys materializadas (consultado en getPendingForPeriod).
+  // Reconstruye los sets de instanceKeys materializadas (consultados en getPending*).
   state.materializedKeys = new Set();
   for (const e of state.expenses) {
     if (e.recurringInstanceKey) state.materializedKeys.add(e.recurringInstanceKey);
   }
+  state.incomeMaterializedKeys = new Set();
+  for (const i of state.income) {
+    if (i.recurringInstanceKey) state.incomeMaterializedKeys.add(i.recurringInstanceKey);
+  }
   render();
+}
+
+/* ================================================================
+   Migración v5: agregado mensual de ingreso → líneas con fecha
+   ================================================================ */
+
+/** Convierte cada registro del store legacy `income` ({id:'YYYY-MM', amountCents})
+ *  en una línea del store `incomes`, fechada al inicio del periodo contable de ese
+ *  mes (queda dentro del mes contable correcto sea cual sea el payrollDay) y con
+ *  una categoría por defecto. Idempotente: usa el flag de settings 'income-migrated'
+ *  y, además, vacía el store legacy tras migrar para no reconvertir. */
+async function migrateIncomeToEntries() {
+  const done = await DB.getSetting('income-migrated');
+  if (done?.value) return;
+
+  const legacy = await DB.getAllIncome();
+  if (Array.isArray(legacy) && legacy.length > 0) {
+    const cats = await DB.getIncomeCategories();
+    const defaultCat = cats.find(c => /salario/i.test(c.name)) || cats[0] || null;
+    const defaultCatId = defaultCat ? defaultCat.id : null;
+
+    const payrollEntry = await DB.getSetting('payroll-day');
+    const pdRaw = payrollEntry?.value;
+    const pd = (typeof pdRaw === 'number' && pdRaw >= 1 && pdRaw <= 28) ? pdRaw : 1;
+
+    for (const rec of legacy) {
+      if (!rec || typeof rec.amountCents !== 'number' || rec.amountCents <= 0) continue;
+      const m = /^(\d{4})-(\d{2})$/.exec(rec.id || '');
+      if (!m) continue;
+      const y = parseInt(m[1], 10), mo = parseInt(m[2], 10);
+      const [startISO] = monthBounds(y, mo, pd);
+      await DB.addIncomeEntry({
+        date: startISO,
+        amountCents: rec.amountCents,
+        description: 'Ingresos',
+        categoryId: defaultCatId,
+        tags: [],
+      });
+    }
+    // El agregado ya está convertido: vaciamos el store legacy.
+    await DB.clearStore('income');
+  }
+
+  await DB.setSetting('income-migrated', true);
 }
 
 /* ================================================================
@@ -110,8 +170,11 @@ function bindGlobalEvents() {
   // Selector de mes
   document.getElementById('btn-month-picker').addEventListener('click', openMonthPicker);
 
-  // FAB quick-add
-  document.getElementById('btn-quick-add').addEventListener('click', () => openQuickAdd());
+  // FAB quick-add: en la vista de Ingresos añade un ingreso; en el resto, un gasto.
+  document.getElementById('btn-quick-add').addEventListener('click', () => {
+    if (state.view === 'savings') openIncomeQuickAdd();
+    else openQuickAdd();
+  });
 
   // Inyectar iconos SVG en los botones de cerrar, menú y FAB
   document.getElementById('btn-sidebar-close').innerHTML = Icons.svg('close', 18);
@@ -420,11 +483,16 @@ function hasMaterializedExpense(recurringId, year, month) {
   return state.materializedKeys.has(buildInstanceKey(year, month, recurringId));
 }
 
+/** Análogo para ingresos recurrentes (set separado, store `incomes`). */
+function hasMaterializedIncome(recurringId, year, month) {
+  return state.incomeMaterializedKeys.has(buildInstanceKey(year, month, recurringId));
+}
+
 /** Devuelve los recurrentes que aún tienen una materialización pendiente
  *  dentro del rango del mes contable (year, month). Cada entrada incluye la
  *  fecha esperada, el importe que se aplicaría y una referencia al recurrente.
  *  Read-only: se materializa cuando llega el día (en boot o tras editar). */
-function getPendingForPeriod(year, month) {
+function getPendingFromRecurrings(recurrings, year, month, hasMaterialized) {
   const payrollDay = state.payrollDay || 1;
   const [periodStart, periodEnd] = monthBounds(year, month, payrollDay);
   const out = [];
@@ -434,7 +502,7 @@ function getPendingForPeriod(year, month) {
   overlapped.add(periodStart.slice(0, 7));
   overlapped.add(periodEnd.slice(0, 7));
 
-  for (const r of state.recurring) {
+  for (const r of recurrings) {
     if (!r.active) continue;
     if (!r.paymentDay) continue;
     const freq = getFrequency(r);
@@ -449,7 +517,7 @@ function getPendingForPeriod(year, month) {
         const day = effectiveDay(r.paymentDay, y, r.paymentMonth);
         const dateStr = `${y}-${String(r.paymentMonth).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
         if (dateStr < periodStart || dateStr > periodEnd) continue;
-        if (hasMaterializedExpense(r.id, y, r.paymentMonth)) continue;
+        if (hasMaterialized(r.id, y, r.paymentMonth)) continue;
         out.push({ recurring: r, date: dateStr, amountCents: materializationAmount(r), freq });
       }
       continue;
@@ -464,13 +532,23 @@ function getPendingForPeriod(year, month) {
       const day = effectiveDay(r.paymentDay, y, m);
       const dateStr = `${ym}-${String(day).padStart(2,'0')}`;
       if (dateStr < periodStart || dateStr > periodEnd) continue;
-      if (hasMaterializedExpense(r.id, y, m)) continue;
+      if (hasMaterialized(r.id, y, m)) continue;
       out.push({ recurring: r, date: dateStr, amountCents: materializationAmount(r), freq });
     }
   }
 
   out.sort((a, b) => a.date.localeCompare(b.date));
   return out;
+}
+
+/** Gastos recurrentes aún no materializados dentro del mes contable (year, month). */
+function getPendingForPeriod(year, month) {
+  return getPendingFromRecurrings(state.recurring, year, month, hasMaterializedExpense);
+}
+
+/** Ingresos recurrentes aún no materializados dentro del mes contable (year, month). */
+function getPendingIncomeForPeriod(year, month) {
+  return getPendingFromRecurrings(state.recurringIncome, year, month, hasMaterializedIncome);
 }
 
 /* ================================================================
@@ -503,7 +581,10 @@ function materializationAmount(r) {
  *  - Para meses dentro de la ventana pero futuros respecto a hoy, solo se
  *    materializa si el día efectivo ya pasó (lo que solo puede ocurrir en el
  *    mes actual; meses pasados completos se materializan siempre). */
-async function materializeRecurrings() {
+/** Núcleo de materialización compartido por gastos e ingresos recurrentes.
+ *  opts = { recurrings, hasByInstanceKey(key), addEntry(obj), sourceField }
+ *  Recorre la ventana de lookback de 3 meses y crea las instancias que falten. */
+async function materializeFromRecurrings(opts) {
   const now = new Date();
   const todayDay = now.getDate();
   const curYear  = now.getFullYear();
@@ -517,11 +598,9 @@ async function materializeRecurrings() {
     window.push({ year: yy, month: mm });
   }
 
-  const recurrings = await DB.getRecurring();
-
   for (const { year, month } of window) {
     const isCurrentMonth = (year === curYear && month === curMonth);
-    for (const r of recurrings) {
+    for (const r of opts.recurrings) {
       if (!r.active) continue;
       if (!r.paymentDay) continue;
       const freq = getFrequency(r);
@@ -533,20 +612,40 @@ async function materializeRecurrings() {
       if (isCurrentMonth && todayDay < day) continue;
 
       const instanceKey = buildInstanceKey(year, month, r.id);
-      if (await DB.hasExpenseByInstanceKey(instanceKey)) continue;
+      if (await opts.hasByInstanceKey(instanceKey)) continue;
 
       const dateStr = `${ymKey(year, month)}-${String(day).padStart(2, '0')}`;
-      await DB.addExpense({
+      await opts.addEntry({
         date: dateStr,
         amountCents: materializationAmount(r),
         description: r.name,
         categoryId: r.categoryId,
         tags: [],
-        sourceRecurringId: r.id,
+        [opts.sourceField]: r.id,
         recurringInstanceKey: instanceKey,
       });
     }
   }
+}
+
+/** Materializa los gastos recurrentes pendientes (ventana de 3 meses). */
+async function materializeRecurrings() {
+  await materializeFromRecurrings({
+    recurrings: await DB.getRecurring(),
+    hasByInstanceKey: (k) => DB.hasExpenseByInstanceKey(k),
+    addEntry: (o) => DB.addExpense(o),
+    sourceField: 'sourceRecurringId',
+  });
+}
+
+/** Materializa los ingresos recurrentes pendientes (mismo motor, store `incomes`). */
+async function materializeRecurringIncome() {
+  await materializeFromRecurrings({
+    recurrings: await DB.getRecurringIncome(),
+    hasByInstanceKey: (k) => DB.hasIncomeByInstanceKey(k),
+    addEntry: (o) => DB.addIncomeEntry(o),
+    sourceField: 'sourceRecurringIncomeId',
+  });
 }
 
 function downloadFile(content, filename, mime) {
@@ -583,13 +682,15 @@ function parseImportDate(str) {
 
 function exportJSON() {
   const data = {
-    categories: state.categories,
-    expenses:   state.expenses,
-    recurring:  state.recurring,
-    income:     state.income,
-    annualGoal: state.annualGoal,
-    exportedAt: new Date().toISOString(),
-    version: 1,
+    categories:       state.categories,
+    expenses:         state.expenses,
+    recurring:        state.recurring,
+    income:           state.income,            // v5: líneas con fecha
+    incomeCategories: state.incomeCategories,
+    recurringIncome:  state.recurringIncome,
+    annualGoal:       state.annualGoal,
+    exportedAt:       new Date().toISOString(),
+    version: 2,
   };
   downloadFile(JSON.stringify(data, null, 2), 'gastos-backup.json', 'application/json');
 }
@@ -614,10 +715,65 @@ function exportCSV() {
   downloadFile('﻿' + csv, 'gastos-expenses.csv', 'text/csv;charset=utf-8');
 }
 
+/** Importa el array `income` de un backup decidiendo el formato ELEMENTO A ELEMENTO
+ *  (robusto frente a backups mixtos), no de forma global:
+ *  - legacy (agregado mensual: id 'YYYY-MM' sin fecha) → se convierte a una línea
+ *    fechada al inicio del periodo contable según el payrollDay actual, con
+ *    categoría por defecto.
+ *  - nuevo (línea con fecha) → replace conserva el id; merge reasigna id y remapea
+ *    categoryId con incIdMap, quitando vínculos a recurrentes. */
+async function importIncomeEntries(incomeArr, mode, incIdMap) {
+  if (!Array.isArray(incomeArr) || incomeArr.length === 0) return;
+
+  // Contexto para convertir registros legacy; se calcula una sola vez y bajo demanda.
+  let legacyCtx = null;
+  async function getLegacyCtx() {
+    if (legacyCtx) return legacyCtx;
+    const cats = await DB.getIncomeCategories();
+    const defaultCat = cats.find(c => /salario/i.test(c.name)) || cats[0] || null;
+    const payrollEntry = await DB.getSetting('payroll-day');
+    const pdRaw = payrollEntry?.value;
+    const pd = (typeof pdRaw === 'number' && pdRaw >= 1 && pdRaw <= 28) ? pdRaw : 1;
+    legacyCtx = { defaultCatId: defaultCat ? defaultCat.id : null, pd };
+    return legacyCtx;
+  }
+
+  for (const item of incomeArr) {
+    if (!item || typeof item.amountCents !== 'number' || item.amountCents <= 0) continue;
+
+    // ¿Registro legacy? (agregado mensual: id 'YYYY-MM' y sin fecha).
+    const legacyMatch = (!item.date && typeof item.id === 'string')
+      ? /^(\d{4})-(\d{2})$/.exec(item.id)
+      : null;
+
+    if (legacyMatch) {
+      const { defaultCatId, pd } = await getLegacyCtx();
+      const [startISO] = monthBounds(parseInt(legacyMatch[1], 10), parseInt(legacyMatch[2], 10), pd);
+      await DB.addIncomeEntry({
+        date: startISO, amountCents: item.amountCents,
+        description: 'Ingresos', categoryId: defaultCatId, tags: [],
+      });
+      continue;
+    }
+
+    // Formato nuevo: línea con fecha.
+    if (!item.date) continue;
+    if (mode === 'replace') {
+      await DB.putIncomeEntry(item);   // conserva el id
+    } else {
+      const { id, sourceRecurringIncomeId, recurringInstanceKey, ...rest } = item;
+      if (incIdMap && rest.categoryId != null && incIdMap.has(rest.categoryId)) {
+        rest.categoryId = incIdMap.get(rest.categoryId);
+      }
+      await DB.addIncomeEntry(rest);
+    }
+  }
+}
+
 /** Aplica un backup JSON a la base de datos.
  *  mode = 'replace'  → vacía todos los stores y restaura tal cual (manteniendo ids).
- *  mode = 'merge'    → conserva lo existente; añade gastos/recurrentes con nuevos ids,
- *                      remapea categoryId por nombre y sobreescribe ingresos por mes. */
+ *  mode = 'merge'    → conserva lo existente; añade con nuevos ids y remapea
+ *                      categoryId (de gasto y de ingreso) por nombre. */
 async function applyJSONImport(backup, mode) {
   if (mode === 'replace') {
     await DB.clearAll();
@@ -630,14 +786,24 @@ async function applyJSONImport(backup, mode) {
       if (!rr.frequency) rr.frequency = rr.annual ? 'annualized' : 'monthly';
       await DB.putRecurring(rr);
     }
-    for (const inc of backup.income   || []) await DB.putIncome(inc);
-    await DB.setSetting('annual-goal', backup.annualGoal || 0);
-    // Las categorías por defecto se siembran si no quedó ninguna en el backup.
+    for (const c of backup.incomeCategories || []) await DB.putIncomeCategory(c);
+    for (const r of backup.recurringIncome  || []) {
+      const rr = { ...r };
+      if (rr.paymentDay == null) rr.paymentDay = 1;
+      if (!rr.frequency) rr.frequency = rr.annual ? 'annualized' : 'monthly';
+      await DB.putRecurringIncome(rr);
+    }
+    // Categorías por defecto antes de las líneas (la conversión legacy las necesita).
     await DB.seedCategories();
+    await DB.seedIncomeCategories();
+    await importIncomeEntries(backup.income, 'replace');
+    await DB.setSetting('annual-goal', backup.annualGoal || 0);
+    // El backup ya trae los ingresos en su forma final: no re-ejecutar la migración.
+    await DB.setSetting('income-migrated', true);
     return;
   }
 
-  // Modo merge: remapear categoryId por nombre.
+  // Modo merge: remapear categoryId (de gasto) por nombre.
   const current = await DB.getCategories();
   const nameToId = new Map(current.map(c => [(c.name || '').toLowerCase(), c.id]));
   const idMap   = new Map();
@@ -679,12 +845,33 @@ async function applyJSONImport(backup, mode) {
     await DB.addRecurring(rest);
   }
 
-  for (const inc of backup.income || []) {
-    if (inc && inc.id && typeof inc.amountCents === 'number') {
-      await DB.putIncome({ id: inc.id, amountCents: inc.amountCents });
+  // Categorías de ingreso: remapear por nombre (espejo del bloque de gasto).
+  const currentInc = await DB.getIncomeCategories();
+  const incNameToId = new Map(currentInc.map(c => [(c.name || '').toLowerCase(), c.id]));
+  const incIdMap = new Map();
+  for (const c of backup.incomeCategories || []) {
+    const key = (c.name || '').toLowerCase();
+    if (incNameToId.has(key)) {
+      incIdMap.set(c.id, incNameToId.get(key));
+    } else {
+      const newId = await DB.addIncomeCategory({ name: c.name, color: c.color, icon: c.icon });
+      incIdMap.set(c.id, newId);
+      incNameToId.set(key, newId);
     }
   }
-  // annualGoal y people no se tocan en modo merge.
+
+  for (const r of backup.recurringIncome || []) {
+    const { id, ...rest } = r;
+    if (rest.categoryId != null && incIdMap.has(rest.categoryId)) {
+      rest.categoryId = incIdMap.get(rest.categoryId);
+    }
+    if (rest.paymentDay == null) rest.paymentDay = 1;
+    if (!rest.frequency) rest.frequency = rest.annual ? 'annualized' : 'monthly';
+    await DB.addRecurringIncome(rest);
+  }
+
+  await importIncomeEntries(backup.income, 'merge', incIdMap);
+  // annualGoal no se toca en modo merge.
 }
 
 function buildJSONImportPreview(jsonText, container) {
@@ -701,7 +888,8 @@ function buildJSONImportPreview(jsonText, container) {
   const isObj = backup && typeof backup === 'object' && !Array.isArray(backup);
   const hasAny = isObj && (
     Array.isArray(backup.categories) || Array.isArray(backup.expenses) ||
-    Array.isArray(backup.recurring)  || Array.isArray(backup.income)
+    Array.isArray(backup.recurring)  || Array.isArray(backup.income) ||
+    Array.isArray(backup.incomeCategories) || Array.isArray(backup.recurringIncome)
   );
   if (!hasAny) {
     container.appendChild(el('div', { class: 'empty-state', text: 'El JSON no tiene el formato esperado (categories, expenses, recurring, income)' }));
@@ -709,10 +897,12 @@ function buildJSONImportPreview(jsonText, container) {
   }
 
   const counts = {
-    categorías: (backup.categories || []).length,
-    gastos:     (backup.expenses   || []).length,
-    recurrentes:(backup.recurring  || []).length,
-    'meses de ingresos': (backup.income || []).length,
+    categorías:          (backup.categories || []).length,
+    gastos:              (backup.expenses   || []).length,
+    recurrentes:         (backup.recurring  || []).length,
+    ingresos:            (backup.income || []).length,
+    'cat. de ingreso':   (backup.incomeCategories || []).length,
+    'ingresos recurrentes': (backup.recurringIncome || []).length,
   };
 
   const info = el('div', { class: 'import-json-info' });
@@ -838,10 +1028,28 @@ function computeMonthTotal(year, month) {
   return { total, expCount: exp.length };
 }
 
+/** Suma de los ingresos REALES (líneas) del mes contable (year, month).
+ *  Respeta el día de nómina igual que computeMonthTotal para los gastos. */
 function getMonthIncome(year, month) {
-  const key = `${year}-${String(month).padStart(2, '0')}`;
-  const entry = state.income.find(i => i.id === key);
-  return entry ? entry.amountCents : 0;
+  return state.income
+    .filter(i => isInAccountingMonth(i.date, year, month, state.payrollDay))
+    .reduce((s, i) => s + (i.amountCents || 0), 0);
+}
+
+/** Desglose de ingresos del mes contable por categoría de ingreso (para el donut). */
+function computeIncomeCatBreakdown(year, month) {
+  const entries = state.income.filter(i => isInAccountingMonth(i.date, year, month, state.payrollDay));
+  const byCat = {};
+  state.incomeCategories.forEach(c => { byCat[c.id] = { ...c, totalCents: 0 }; });
+  let uncatTotal = 0;
+  entries.forEach(i => {
+    if (byCat[i.categoryId]) byCat[i.categoryId].totalCents += i.amountCents;
+    else uncatTotal += i.amountCents;
+  });
+  if (uncatTotal > 0) {
+    byCat['__uncat__'] = { id: '__uncat__', name: 'Sin categoría', color: '#7f8c8d', icon: 'package', totalCents: uncatTotal };
+  }
+  return byCat;
 }
 
 function computeCatBreakdown(year, month) {
@@ -1754,33 +1962,72 @@ function buildDayPicker(options = {}) {
    Vista: Gastos recurrentes
    ================================================================ */
 
+// Configuración por dominio del gestor de recurrentes. El mismo motor sirve para
+// gastos recurrentes (pestaña Recurrentes) e ingresos recurrentes (Ajustes).
+const RECURRING_EXPENSE_OPTS = {
+  title: 'Gastos recurrentes y anualizados',
+  namePlaceholder: 'Nombre (Hipoteca, Netflix…)',
+  catLabel: 'Categoría',
+  dayLabel: 'Día de cobro',
+  addLabel: 'Añadir recurrente',
+  emptyLabel: 'Sin gastos recurrentes definidos',
+  noun: 'gasto',
+  catSource: () => state.categories,
+  list: () => state.recurring,
+  add: (r) => DB.addRecurring(r),
+  update: (r) => DB.updateRecurring(r),
+  remove: (id) => DB.deleteRecurring(id),
+  materialize: () => materializeRecurrings(),
+};
+const RECURRING_INCOME_OPTS = {
+  title: 'Ingresos recurrentes',
+  namePlaceholder: 'Nombre (Nómina, Alquiler…)',
+  catLabel: 'Fuente',
+  dayLabel: 'Día de ingreso',
+  addLabel: 'Añadir ingreso recurrente',
+  emptyLabel: 'Sin ingresos recurrentes definidos',
+  noun: 'ingreso',
+  catSource: () => state.incomeCategories,
+  list: () => state.recurringIncome,
+  add: (r) => DB.addRecurringIncome(r),
+  update: (r) => DB.updateRecurringIncome(r),
+  remove: (id) => DB.deleteRecurringIncome(id),
+  materialize: () => materializeRecurringIncome(),
+};
+
+/** Vista de gastos recurrentes (pestaña Recurrentes). */
 function renderRecurring(container) {
+  container.appendChild(buildRecurringManager(RECURRING_EXPENSE_OPTS));
+}
+
+/** Gestor genérico de recurrentes (formulario + lista). Devuelve la card. */
+function buildRecurringManager(opts) {
   const card = el('div', { class: 'card' });
   card.style.maxWidth = '720px';
   card.style.margin = '0 auto';
 
   card.appendChild(
     el('div', { class: 'card-header' },
-      el('h2', { class: 'card-title', text: 'Gastos recurrentes y anualizados' }),
+      el('h2', { class: 'card-title', text: opts.title }),
     )
   );
 
   // Formulario
   const form = el('form', { class: 'recurring-form' });
 
-  const nameInput = el('input', { class: 'form-input', placeholder: 'Nombre (Hipoteca, Netflix…)', id: 'rec-name' });
+  const nameInput = el('input', { class: 'form-input', placeholder: opts.namePlaceholder });
   form.appendChild(wrap('Nombre', nameInput));
 
-  const amtInput = el('input', { class: 'form-input mono', placeholder: '0,00', inputmode: 'decimal', id: 'rec-amount' });
+  const amtInput = el('input', { class: 'form-input mono', placeholder: '0,00', inputmode: 'decimal' });
   form.appendChild(wrap('Importe (€)', amtInput));
 
-  const catSelect = el('select', { class: 'form-input', id: 'rec-cat' });
-  catSelect.appendChild(el('option', { value: '', text: '— Categoría —' }));
-  state.categories.forEach(c => {
+  const catSelect = el('select', { class: 'form-input' });
+  catSelect.appendChild(el('option', { value: '', text: `— ${opts.catLabel} —` }));
+  opts.catSource().forEach(c => {
     catSelect.appendChild(el('option', { value: c.id, text: c.name }));
   });
   // Categoría a ancho completo.
-  const catGroup = wrap('Categoría', catSelect);
+  const catGroup = wrap(opts.catLabel, catSelect);
   catGroup.classList.add('full-width');
   form.appendChild(catGroup);
 
@@ -1791,9 +2038,9 @@ function renderRecurring(container) {
   freqGroup.appendChild(freqRadios.element);
   form.appendChild(freqGroup);
 
-  // Día de cobro (obligatorio) — el picker amplía a día+mes cuando freq=annual.
+  // Día de cobro/ingreso (obligatorio) — el picker amplía a día+mes cuando freq=annual.
   const dayPicker = buildDayPicker({ includeMonth: false });
-  const dayGroup = wrap('Día de cobro', dayPicker.element);
+  const dayGroup = wrap(opts.dayLabel, dayPicker.element);
   dayGroup.classList.add('full-width');
   form.appendChild(dayGroup);
 
@@ -1803,12 +2050,12 @@ function renderRecurring(container) {
 
   // Rango de vigencia (mes de inicio obligatorio, fin opcional)
   const defaultStart = ymKey(state.year, state.month);
-  const startInput = el('input', { type: 'month', class: 'form-input', id: 'rec-start', value: defaultStart });
+  const startInput = el('input', { type: 'month', class: 'form-input', value: defaultStart });
   form.appendChild(wrap('Desde (mes)', startInput));
-  const endInput = el('input', { type: 'month', class: 'form-input', id: 'rec-end' });
+  const endInput = el('input', { type: 'month', class: 'form-input' });
   form.appendChild(wrap('Hasta (opcional)', endInput));
 
-  form.appendChild(el('button', { type: 'submit', class: 'btn btn-primary', text: 'Añadir recurrente' }));
+  form.appendChild(el('button', { type: 'submit', class: 'btn btn-primary', text: opts.addLabel }));
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1816,7 +2063,7 @@ function renderRecurring(container) {
     const catId = parseInt(catSelect.value, 10);
     if (!nameInput.value.trim() || cents <= 0 || !catId) return;
     if (!dayPicker.isValid()) {
-      alert('Selecciona la fecha de cobro');
+      alert('Selecciona la fecha');
       return;
     }
     const startMonth = startInput.value || currentYmKey();
@@ -1829,7 +2076,7 @@ function renderRecurring(container) {
     const dayVal = dayPicker.getValue();
     const paymentDay   = (typeof dayVal === 'object') ? dayVal.day   : dayVal;
     const paymentMonth = (typeof dayVal === 'object') ? dayVal.month : null;
-    await DB.addRecurring({
+    await opts.add({
       name: nameInput.value.trim(),
       amountCents: cents,
       categoryId: catId,
@@ -1841,37 +2088,37 @@ function renderRecurring(container) {
       paymentMonth,
     });
     // No limpiamos inputs: reload() reconstruye el form. Materializamos antes
-    // del reload para que la fila aparezca ya con el gasto del mes en curso.
-    await materializeRecurrings();
+    // del reload para que la fila aparezca ya con la instancia del mes en curso.
+    await opts.materialize();
     await reload();
   });
 
   card.appendChild(form);
 
   // Lista
-  const divider = el('hr', { class: 'divider' });
-  card.appendChild(divider);
+  card.appendChild(el('hr', { class: 'divider' }));
 
-  if (state.recurring.length === 0) {
-    card.appendChild(el('div', { class: 'empty-state', text: 'Sin gastos recurrentes definidos' }));
+  const items = opts.list();
+  if (items.length === 0) {
+    card.appendChild(el('div', { class: 'empty-state', text: opts.emptyLabel }));
   } else {
     const list = el('div', { class: 'recurring-list' });
     // Ordenar: vigentes primero, expirados al final
-    const sorted = [...state.recurring].sort((a, b) => {
+    const sorted = [...items].sort((a, b) => {
       const ae = isRecurringExpired(a) ? 1 : 0;
       const be = isRecurringExpired(b) ? 1 : 0;
       return ae - be;
     });
-    sorted.forEach(r => list.appendChild(buildRecurringRow(r)));
+    sorted.forEach(r => list.appendChild(buildRecurringRow(r, opts)));
     card.appendChild(list);
   }
 
-  container.appendChild(card);
+  return card;
 }
 
-/** Construye una fila de la lista de recurrentes. */
-function buildRecurringRow(r) {
-  const cat = state.categories.find(c => c.id === r.categoryId);
+/** Construye una fila de la lista de recurrentes (opts = dominio gasto/ingreso). */
+function buildRecurringRow(r, opts) {
+  const cat = opts.catSource().find(c => c.id === r.categoryId);
   const expired = isRecurringExpired(r);
   const row = el('div', {
     class: `recurring-row ${r.active ? '' : 'inactive'} ${expired ? 'expired' : ''}`.trim(),
@@ -1942,9 +2189,9 @@ function buildRecurringRow(r) {
     html: Icons.svg(r.active ? 'pause' : 'play', 14),
     onClick: async () => {
       const next = !r.active;
-      await DB.updateRecurring({ ...r, active: next });
+      await opts.update({ ...r, active: next });
       // Si se reactiva y el día ya pasó este mes, materializar al instante.
-      if (next) await materializeRecurrings();
+      if (next) await opts.materialize();
       await reload();
     },
   });
@@ -1952,7 +2199,7 @@ function buildRecurringRow(r) {
 
   const editBtn = el('button', {
     class: 'btn-edit', html: Icons.svg('edit', 14),
-    onClick: () => openRecurringEdit(r),
+    onClick: () => openRecurringEdit(r, opts),
   });
   row.appendChild(editBtn);
 
@@ -1960,7 +2207,7 @@ function buildRecurringRow(r) {
     class: 'btn-delete', html: Icons.svg('close', 14),
     onClick: async () => {
       if (!confirm(`¿Eliminar "${r.name}"?`)) return;
-      await DB.deleteRecurring(r.id);
+      await opts.remove(r.id);
       await reload();
     },
   });
@@ -1970,7 +2217,7 @@ function buildRecurringRow(r) {
 }
 
 /** Abre un modal para editar un recurrente existente (todos los campos). */
-function openRecurringEdit(r) {
+function openRecurringEdit(r, opts) {
   openModal(`Editar "${r.name}"`, (body) => {
     const form = el('form', { class: 'recurring-form' });
 
@@ -1984,12 +2231,12 @@ function openRecurringEdit(r) {
     form.appendChild(wrap('Importe (€)', amtInput));
 
     const catSelect = el('select', { class: 'form-input' });
-    state.categories.forEach(c => {
+    opts.catSource().forEach(c => {
       const opt = el('option', { value: c.id, text: c.name });
       if (c.id === r.categoryId) opt.selected = true;
       catSelect.appendChild(opt);
     });
-    const catGroup = wrap('Categoría', catSelect);
+    const catGroup = wrap(opts.catLabel, catSelect);
     catGroup.classList.add('full-width');
     form.appendChild(catGroup);
 
@@ -2007,7 +2254,7 @@ function openRecurringEdit(r) {
       month: r.paymentMonth || null,
       includeMonth: initialFreq === 'annual',
     });
-    const dayGroup = wrap('Día de cobro', dayPicker.element);
+    const dayGroup = wrap(opts.dayLabel, dayPicker.element);
     dayGroup.classList.add('full-width');
     form.appendChild(dayGroup);
 
@@ -2034,7 +2281,7 @@ function openRecurringEdit(r) {
       const catId = parseInt(catSelect.value, 10);
       if (!nameInput.value.trim() || cents <= 0 || !catId) return;
       if (!dayPicker.isValid()) {
-        alert('Selecciona la fecha de cobro');
+        alert('Selecciona la fecha');
         return;
       }
       const startMonth = startInput.value || null;
@@ -2049,7 +2296,7 @@ function openRecurringEdit(r) {
       const paymentMonth = (typeof dayVal === 'object') ? dayVal.month : null;
       // Limpiamos el bool annual legacy para que getFrequency lea siempre el campo nuevo.
       const { annual, ...rest } = r;
-      await DB.updateRecurring({
+      await opts.update({
         ...rest,
         name: nameInput.value.trim(),
         amountCents: cents,
@@ -2062,7 +2309,7 @@ function openRecurringEdit(r) {
       });
       closeModal();
       // Si el nuevo día ya pasó (en cualquier mes de la ventana de lookback), materializar.
-      await materializeRecurrings();
+      await opts.materialize();
       await reload();
     });
 
@@ -2135,9 +2382,9 @@ async function renderReports(container) {
     const topPct = ((top.totalCents / catYearTotal) * 100).toFixed(1).replace('.', ',');
     statG.appendChild(stat('Categoría top', top.totalCents, `${top.name} · ${topPct}%`));
   }
-  // Tasa de ahorro anual: (ingresos - gastos) / ingresos
+  // Tasa de ahorro anual: (ingresos - gastos) / ingresos. Ingresos por año contable.
   const yearIncome = state.income
-    .filter(i => i.id && i.id.startsWith(`${state.year}-`))
+    .filter(i => isInAccountingYear(i.date, state.year, state.payrollDay))
     .reduce((s, i) => s + (i.amountCents || 0), 0);
   if (yearIncome > 0) {
     const savings = yearIncome - yearTotal;
@@ -2351,6 +2598,12 @@ function renderSettings(container) {
   // Estado inicial.
   markSelected(current.accent);
   refreshName(current);
+
+  /* ---------- Card: Categorías de ingreso ---------- */
+  wrap.appendChild(buildIncomeCategoriesCard());
+
+  /* ---------- Card: Ingresos recurrentes ---------- */
+  wrap.appendChild(buildRecurringManager(RECURRING_INCOME_OPTS));
 
   /* ---------- Card: Almacenamiento ---------- */
   const storage = el('div', { class: 'card' });
@@ -2621,12 +2874,15 @@ function renderCategories(container) {
   container.appendChild(card);
 }
 
-/** Modal de creación/edición de categoría. Si `cat` es null → modo creación. */
-function openCategoryModal(cat) {
+/** Modal de creación/edición de categoría. Si `cat` es null → modo creación.
+ *  opts.kind = 'expense' (default) | 'income'. Las categorías de ingreso no tienen
+ *  límite mensual y se guardan en su propio store. */
+function openCategoryModal(cat, opts = {}) {
+  const isIncome = opts.kind === 'income';
   const isEdit = !!cat;
-  const initial = cat || { name: '', color: '#c47a1a', icon: '', monthlyLimitCents: 0 };
+  const initial = cat || { name: '', color: isIncome ? '#27ae60' : '#c47a1a', icon: '', monthlyLimitCents: 0 };
 
-  openModal(isEdit ? `Editar "${cat.name}"` : 'Nueva categoría', (body) => {
+  openModal(isEdit ? `Editar "${cat.name}"` : (isIncome ? 'Nueva categoría de ingreso' : 'Nueva categoría'), (body) => {
     // ---- Preview chip (live) ----
     const preview = el('div', { class: 'category-preview' });
     const previewDot  = el('span', { class: 'dot-lg', style: { backgroundColor: initial.color } });
@@ -2663,7 +2919,7 @@ function openCategoryModal(cat) {
     colorGroup.appendChild(colorInp);
     form.appendChild(colorGroup);
 
-    // Límite mensual
+    // Límite mensual — solo aplica a categorías de gasto.
     const limitGroup = el('div', { class: 'form-group' });
     limitGroup.appendChild(el('label', { class: 'form-label', text: 'Límite mensual (€)' }));
     const limitInp = el('input', {
@@ -2675,7 +2931,7 @@ function openCategoryModal(cat) {
       placeholder: 'Sin límite',
     });
     limitGroup.appendChild(limitInp);
-    form.appendChild(limitGroup);
+    if (!isIncome) form.appendChild(limitGroup);
 
     // Icono (full)
     const iconGroup = el('div', { class: 'form-group full-width' });
@@ -2724,17 +2980,20 @@ function openCategoryModal(cat) {
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       if (!nameInp.value.trim()) return;
-      const limitCents = limitInp.value.trim() ? eurToCents(limitInp.value) : 0;
       const payload = {
         name: nameInp.value.trim(),
         color: colorInp.value,
         icon: picker.dataset.value || '',
-        monthlyLimitCents: limitCents,
       };
-      if (isEdit) {
-        await DB.updateCategory({ ...cat, ...payload });
+      if (!isIncome) {
+        payload.monthlyLimitCents = limitInp.value.trim() ? eurToCents(limitInp.value) : 0;
+      }
+      if (isIncome) {
+        if (isEdit) await DB.updateIncomeCategory({ ...cat, ...payload });
+        else        await DB.addIncomeCategory(payload);
       } else {
-        await DB.addCategory(payload);
+        if (isEdit) await DB.updateCategory({ ...cat, ...payload });
+        else        await DB.addCategory(payload);
       }
       closeModal();
       await reload();
@@ -2743,6 +3002,56 @@ function openCategoryModal(cat) {
     body.appendChild(form);
     setTimeout(() => nameInp.focus(), 50);
   });
+}
+
+/** Tarjeta de gestión de categorías de ingreso (se muestra en Ajustes). */
+function buildIncomeCategoriesCard() {
+  const card = el('div', { class: 'card' });
+  card.appendChild(el('h2', { class: 'card-title', text: 'Categorías de ingreso' }));
+  card.appendChild(el('p', {
+    class: 'settings-card-desc',
+    text: 'Las fuentes de tus ingresos (salario, alquileres, inversiones…), con color e icono para el desglose.',
+  }));
+
+  const addBtn = el('button', {
+    type: 'button', class: 'btn btn-primary category-add-btn',
+    onClick: () => openCategoryModal(null, { kind: 'income' }),
+  });
+  addBtn.innerHTML = `${Icons.svg('plus', 14)} <span>Nueva categoría de ingreso</span>`;
+  card.appendChild(addBtn);
+
+  const list = el('div', { class: 'category-list' });
+  if (state.incomeCategories.length === 0) {
+    list.appendChild(el('div', { class: 'empty-state', text: 'Sin categorías de ingreso' }));
+  }
+  state.incomeCategories.forEach(c => {
+    const row = el('div', { class: 'category-row' });
+    row.appendChild(el('span', { class: 'dot-lg', style: { backgroundColor: c.color } }));
+    if (Icons.has(c.icon)) {
+      const ico = el('span', { class: 'category-icon' });
+      ico.innerHTML = Icons.svg(c.icon, 18);
+      row.appendChild(ico);
+    } else if (c.icon) {
+      row.appendChild(el('span', { class: 'category-icon', text: c.icon }));
+    }
+    row.appendChild(el('span', { class: 'category-name', text: c.name }));
+    row.appendChild(el('button', {
+      class: 'btn-edit', html: Icons.svg('edit', 14), title: 'Editar',
+      onClick: () => openCategoryModal(c, { kind: 'income' }),
+    }));
+    row.appendChild(el('button', {
+      class: 'btn-delete', html: Icons.svg('close', 14), title: 'Eliminar',
+      onClick: async () => {
+        if (!confirm(`¿Eliminar "${c.name}"?\nLos ingresos asociados se mostrarán como "Sin categoría", pero no se borrarán.`)) return;
+        await DB.deleteIncomeCategory(c.id);
+        await reload();
+      },
+    }));
+    list.appendChild(row);
+  });
+  card.appendChild(list);
+
+  return card;
 }
 
 /* ================================================================
@@ -2933,7 +3242,7 @@ function buildIncomeReportCard() {
   if (!months12.some(mo => mo.hasData)) {
     card.appendChild(el('div', {
       class: 'empty-state',
-      text: 'Registra tus ingresos en la pestaña "Ahorro" para ver este informe',
+      text: 'Registra tus ingresos en la pestaña "Ingresos" para ver este informe',
     }));
     return card;
   }
@@ -2985,13 +3294,25 @@ function buildIncomeReportCard() {
 }
 
 /* ================================================================
-   Vista: Ahorro
+   Vista: Ingresos (lista de líneas + ahorro; antes «Ahorro»)
    ================================================================ */
 
 function renderSavings(container) {
+  const payrollDay = state.payrollDay || 1;
   const monthIncome   = getMonthIncome(state.year, state.month);
   const { total: monthExpenses } = computeMonthTotal(state.year, state.month);
   const monthSavings  = monthIncome - monthExpenses;
+
+  // Líneas de ingreso REALES del mes contable (ad-hoc + materializadas de recurrente).
+  const monthIncomeEntries = state.income
+    .filter(i => isInAccountingMonth(i.date, state.year, state.month, payrollDay))
+    .sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
+  // Pendientes del periodo (recurrentes aún no materializados).
+  const pending       = getPendingForPeriod(state.year, state.month);
+  const pendingIncome = getPendingIncomeForPeriod(state.year, state.month);
+  const pendingExpTotal = pending.reduce((s, p) => s + p.amountCents, 0);
+  const pendingIncTotal = pendingIncome.reduce((s, p) => s + p.amountCents, 0);
 
   // Total ahorrado en el año (solo meses con ingresos definidos)
   let yearSavings = 0, monthsWithData = 0;
@@ -3009,12 +3330,12 @@ function renderSavings(container) {
     : 0;
 
   const title = el('h2', { class: 'card-title', style: { marginBottom: '8px' } });
-  title.innerHTML = `Ahorro &mdash; ${monthName(state.month)} ${state.year}`;
+  title.innerHTML = `Ingresos &mdash; ${monthName(state.month)} ${state.year}`;
   container.appendChild(title);
 
   // Indicador del rango del mes contable (solo cuando difiere del mes natural).
-  if ((state.payrollDay || 1) > 1) {
-    const [s, e] = monthBounds(state.year, state.month, state.payrollDay);
+  if (payrollDay > 1) {
+    const [s, e] = monthBounds(state.year, state.month, payrollDay);
     container.appendChild(el('p', {
       class: 'expense-meta',
       style: { marginBottom: '20px' },
@@ -3028,26 +3349,35 @@ function renderSavings(container) {
 
   // ---- Tarjeta del mes ----
   const monthCard = el('div', { class: 'card' });
-  monthCard.appendChild(el('div', { class: 'report-section-title', text: 'Ingresos del mes' }));
+  const incHeader = el('div', { class: 'card-header' });
+  incHeader.appendChild(el('div', { class: 'report-section-title', style: { margin: '0' }, text: 'Ingresos del mes' }));
+  const addIncBtn = el('button', {
+    type: 'button', class: 'btn btn-primary btn-sm',
+    onClick: () => openIncomeQuickAdd(),
+  });
+  addIncBtn.innerHTML = `${Icons.svg('plus', 14)} <span>Añadir ingreso</span>`;
+  incHeader.appendChild(addIncBtn);
+  monthCard.appendChild(incHeader);
 
-  const incomeRow = el('div', { class: 'savings-income-group' });
-  const incomeInput = el('input', {
-    type: 'text', inputmode: 'decimal', class: 'form-input mono savings-income-input',
-    placeholder: '0,00',
-    value: monthIncome > 0 ? (monthIncome / 100).toFixed(2).replace('.', ',') : '',
-  });
-  incomeRow.appendChild(incomeInput);
-  const saveBtnInc = el('button', {
-    type: 'button', class: 'btn btn-primary btn-sm', text: 'Guardar',
-    onClick: async () => {
-      const raw = incomeInput.value.trim();
-      await DB.setIncome(state.year, state.month, raw ? eurToCents(raw) : 0);
-      await reload();
-    },
-  });
-  incomeRow.appendChild(saveBtnInc);
-  incomeInput.addEventListener('keydown', e => { if (e.key === 'Enter') saveBtnInc.click(); });
-  monthCard.appendChild(incomeRow);
+  // Lista de líneas de ingreso del mes contable.
+  if (monthIncomeEntries.length === 0) {
+    monthCard.appendChild(el('div', {
+      class: 'empty-state',
+      text: 'Sin ingresos este mes. Pulsa «Añadir ingreso» para registrar el primero.',
+    }));
+  } else {
+    const list = el('div', { class: 'expense-list income-list' });
+    monthIncomeEntries.forEach(i => list.appendChild(buildIncomeRow(i)));
+    monthCard.appendChild(list);
+  }
+
+  // Pendiente de ingreso (recurrentes no materializados aún en el periodo).
+  if (pendingIncome.length > 0) {
+    const pi = el('div', { class: 'savings-projection-hint' });
+    pi.appendChild(el('span', { text: `Ingresos pendientes este periodo (${pendingIncome.length})` }));
+    pi.appendChild(el('span', { class: 'mono amount-pos', text: fmtEUR(pendingIncTotal) }));
+    monthCard.appendChild(pi);
+  }
 
   // Stats del mes
   const statsGrid = el('div', { class: 'savings-stats' });
@@ -3059,8 +3389,8 @@ function renderSavings(container) {
     return item;
   }
 
-  statsGrid.appendChild(savStat('Gasto real', fmtEUR(monthExpenses)));
   statsGrid.appendChild(savStat('Ingresos', monthIncome > 0 ? fmtEUR(monthIncome) : '—'));
+  statsGrid.appendChild(savStat('Gasto real', fmtEUR(monthExpenses)));
 
   const savMain = el('div', { class: 'savings-stat-item savings-stat-main' });
   savMain.appendChild(el('span', { class: 'savings-stat-label', text: 'Ahorro real' }));
@@ -3075,13 +3405,15 @@ function renderSavings(container) {
   statsGrid.appendChild(savMain);
   monthCard.appendChild(statsGrid);
 
-  // Indicador secundario: ahorro proyectado si se materializa todo lo pendiente.
-  const pending = getPendingForPeriod(state.year, state.month);
-  if (monthIncome > 0 && pending.length > 0) {
-    const pendingTotal = pending.reduce((s, p) => s + p.amountCents, 0);
-    const projectedSavings = monthIncome - (monthExpenses + pendingTotal);
+  // Indicador secundario: ahorro proyectado si se materializa todo lo pendiente
+  // (suma los ingresos pendientes y resta los gastos pendientes del periodo).
+  if ((monthIncome > 0 || pendingIncTotal > 0) && (pending.length > 0 || pendingIncome.length > 0)) {
+    const projectedSavings = (monthIncome + pendingIncTotal) - (monthExpenses + pendingExpTotal);
+    const parts = [];
+    if (pendingIncome.length > 0) parts.push(`+${fmtEUR(pendingIncTotal)} ingreso`);
+    if (pending.length > 0)       parts.push(`−${fmtEUR(pendingExpTotal)} gasto`);
     const hint = el('div', { class: 'savings-projection-hint' });
-    hint.appendChild(el('span', { text: `Si se materializa lo pendiente (${pending.length}, ${fmtEUR(pendingTotal)})` }));
+    hint.appendChild(el('span', { text: `Si se materializa lo pendiente (${parts.join(', ')})` }));
     const proj = el('span', { class: `mono ${projectedSavings >= 0 ? 'amount-pos' : 'amount-neg'}` });
     proj.textContent = projectedSavings >= 0 ? fmtEUR(projectedSavings) : '−' + fmtEUR(-projectedSavings);
     hint.appendChild(proj);
@@ -3155,6 +3487,41 @@ function renderSavings(container) {
   grid.appendChild(goalCard);
   container.appendChild(grid);
 
+  // ---- Donut: distribución de ingresos del mes por fuente ----
+  const incBreakdown = computeIncomeCatBreakdown(state.year, state.month);
+  const incChartData = Object.values(incBreakdown)
+    .filter(c => c.totalCents > 0)
+    .sort((a, b) => b.totalCents - a.totalCents);
+  if (monthIncome > 0 && incChartData.length > 0) {
+    const donutCard = el('div', { class: 'card chart-card' });
+    donutCard.appendChild(el('div', { class: 'report-section-title', text: 'Distribución de ingresos' }));
+
+    const chartWrap = el('div', { class: 'chart-wrapper' });
+    chartWrap.appendChild(el('canvas', { id: 'income-donut-canvas' }));
+    chartWrap.appendChild(el('div', { class: 'chart-center' },
+      el('span', { class: 'chart-center-label', text: 'Ingresos' }),
+      el('span', { class: 'chart-center-amount', text: fmtEUR(monthIncome) }),
+    ));
+    donutCard.appendChild(chartWrap);
+
+    const legend = el('div', { class: 'chart-legend' });
+    incChartData.forEach(c => {
+      const pct = ((c.totalCents / monthIncome) * 100).toFixed(1);
+      const nameSpan = el('span', { class: 'legend-name' });
+      appendIconText(nameSpan, c.icon, c.name, 12);
+      legend.appendChild(el('div', { class: 'legend-item' },
+        el('span', { class: 'legend-dot', style: { backgroundColor: c.color } }),
+        nameSpan,
+        el('span', { class: 'legend-value', text: fmtEUR(c.totalCents) }),
+        el('span', { class: 'legend-pct', text: `${pct}%` }),
+      ));
+    });
+    donutCard.appendChild(legend);
+    container.appendChild(donutCard);
+
+    requestAnimationFrame(() => DonutChart.render('income-donut-canvas', incChartData, monthIncome));
+  }
+
   // ---- Gráfico de evolución acumulada ----
   const histMonths = [];
   let hy = state.year, hm = state.month;
@@ -3183,6 +3550,138 @@ function renderSavings(container) {
 
     requestAnimationFrame(() => LineChart.render('patrimony-canvas', labels, values));
   }
+}
+
+/** Construye una fila de la lista de ingresos del mes (espejo de buildExpenseList). */
+function buildIncomeRow(i) {
+  const cat = state.incomeCategories.find(c => c.id === i.categoryId);
+  const color = cat?.color || '#27ae60';
+  const isRecurring = !!i.sourceRecurringIncomeId;
+  const item = {
+    id: i.id,
+    description: i.description,
+    desc: i.description || cat?.name || 'Ingreso',
+    categoryId: i.categoryId,
+    catName: cat?.name || 'Sin categoría',
+    icon: cat?.icon || '',
+    amount: i.amountCents,
+    date: i.date,
+    tags: i.tags || [],
+    sourceRecurringIncomeId: i.sourceRecurringIncomeId || null,
+  };
+
+  const row = el('div', { class: 'expense-row' });
+  row.appendChild(el('span', { class: 'dot', style: { backgroundColor: color } }));
+
+  const info = el('div', { class: 'expense-info' });
+  const topLine = el('div', { class: 'expense-top-line' });
+  const descSpan = el('span', { class: 'expense-desc' });
+  appendIconText(descSpan, item.icon, item.desc, 14);
+  topLine.appendChild(descSpan);
+  if (isRecurring) {
+    topLine.appendChild(el('span', {
+      class: 'expense-recurring-mark',
+      title: 'Generado a partir de un ingreso recurrente',
+      'aria-label': 'Recurrente',
+      html: Icons.svg('repeat', 12),
+    }));
+  }
+  (item.tags || []).forEach(tag => {
+    topLine.appendChild(el('span', { class: 'tag-chip tag-chip-sm', text: '#' + tag }));
+  });
+  info.appendChild(topLine);
+
+  let meta = item.catName;
+  if (item.date) meta += ` · ${fmtDate(item.date)}`;
+  info.appendChild(el('div', { class: 'expense-meta', text: meta }));
+  row.appendChild(info);
+
+  row.appendChild(el('span', { class: 'expense-amount mono amount-pos', text: fmtEUR(item.amount) }));
+
+  row.appendChild(el('button', {
+    class: 'btn-edit', html: Icons.svg('edit', 14), title: 'Editar',
+    onClick: () => openIncomeInlineEdit(item, row),
+  }));
+  row.appendChild(el('button', {
+    class: 'btn-delete', html: Icons.svg('close', 14), title: 'Eliminar',
+    onClick: async () => {
+      if (!confirm('¿Eliminar este ingreso?')) return;
+      await DB.deleteIncomeEntry(item.id);
+      await reload();
+    },
+  }));
+
+  return row;
+}
+
+/** Edición inline de una línea de ingreso (espejo de openInlineEdit). */
+function openIncomeInlineEdit(item, row) {
+  clear(row);
+  row.classList.add('expense-row--editing');
+
+  const amountVal = (item.amount / 100).toFixed(2).replace('.', ',');
+
+  const amtInput = el('input', {
+    type: 'text', inputmode: 'decimal', class: 'form-input mono',
+    value: amountVal, style: { width: '110px' },
+  });
+
+  const catSelect = el('select', { class: 'form-input', style: { flex: '1', minWidth: '130px' } });
+  state.incomeCategories.forEach(c => {
+    const opt = el('option', { value: c.id, text: c.name });
+    if (c.id === item.categoryId) opt.selected = true;
+    catSelect.appendChild(opt);
+  });
+
+  const dateInput = el('input', {
+    type: 'date', class: 'form-input', value: item.date, style: { width: '145px' },
+  });
+  const descInput = el('input', {
+    type: 'text', class: 'form-input', value: item.description || '',
+    placeholder: 'Descripción', style: { flex: '1', minWidth: '120px' },
+  });
+  const tagsInlineInput = el('input', {
+    type: 'text', class: 'form-input',
+    value: (item.tags || []).map(t => '#' + t).join(' '),
+    placeholder: 'Etiquetas', style: { minWidth: '110px' },
+  });
+
+  const fields = el('div', { class: 'edit-row-fields' });
+  [amtInput, catSelect, dateInput, descInput, tagsInlineInput].forEach(f => fields.appendChild(f));
+  row.appendChild(fields);
+
+  async function save() {
+    const cents = eurToCents(amtInput.value);
+    const catId = parseInt(catSelect.value, 10);
+    if (cents <= 0 || !catId) return;
+    // Spread del original para preservar sourceRecurringIncomeId / recurringInstanceKey
+    // de las líneas materializadas (sin esto se rematerializarían → duplicado).
+    const original = state.income.find(x => x.id === item.id) || {};
+    await DB.updateIncomeEntry({
+      ...original,
+      id: item.id,
+      date: dateInput.value || today(),
+      amountCents: cents,
+      description: descInput.value.trim(),
+      categoryId: catId,
+      tags: parseTags(tagsInlineInput.value),
+    });
+    await reload();
+  }
+
+  const saveBtn   = el('button', { class: 'btn btn-primary btn-sm', text: 'Guardar',  onClick: save });
+  const cancelBtn = el('button', { class: 'btn btn-ghost btn-sm',   text: 'Cancelar', onClick: reload });
+  row.appendChild(el('div', { class: 'edit-row-actions' }, cancelBtn, saveBtn));
+
+  [amtInput, descInput, dateInput, tagsInlineInput].forEach(inp => {
+    inp.addEventListener('keydown', e => {
+      if (e.key === 'Enter') save();
+      if (e.key === 'Escape') reload();
+    });
+  });
+
+  amtInput.focus();
+  amtInput.select();
 }
 
 /* ================================================================
@@ -3381,6 +3880,20 @@ function openImportCSVModal() {
    ================================================================ */
 
 const CHANGELOG = [
+  {
+    version: '1.20',
+    date: 'Junio 2026',
+    items: [
+      'Los ingresos dejan de ser un único importe mensual y pasan a ser LÍNEAS con fecha, igual que los gastos: puedes registrar varios ingresos en el mes (nómina, alquiler, dividendos…) sin sumarlos a mano',
+      'Categorías de ingreso propias (con color e icono) y nuevo donut «Distribución de ingresos» por fuente en la pestaña de Ingresos',
+      'Ingresos recurrentes: define una nómina o un alquiler que se materializa solo cada mes (mensual / anualizado / anual), con el mismo motor que los gastos recurrentes',
+      'La pestaña «Ahorro» pasa a llamarse «Ingresos»: lista los ingresos del mes y su botón de añadir, manteniendo el objetivo anual, las estadísticas de ahorro y el gráfico de evolución',
+      'La gestión de categorías de ingreso y de ingresos recurrentes vive en Ajustes',
+      'Los ingresos respetan el día de nómina (mes contable), igual que los gastos: ingresos, gastos y ahorro quedan siempre dentro del mismo periodo',
+      'La proyección de ahorro ahora también suma los ingresos recurrentes pendientes, además de restar los gastos pendientes',
+      'Migración automática: tu ingreso mensual anterior se convierte en una línea por mes, sin pérdida de histórico. Los backups antiguos se siguen importando',
+    ],
+  },
   {
     version: '1.19',
     date: 'Junio 2026',
@@ -3604,7 +4117,7 @@ const CHANGELOG = [
 // Vistas de consulta (aparecen en la barra superior).
 const MAIN_TABS = [
   { id: 'dashboard',  label: 'Gastos' },
-  { id: 'savings',    label: 'Ahorro' },
+  { id: 'savings',    label: 'Ingresos' },
   { id: 'calendar',   label: 'Calendario' },
   { id: 'reports',    label: 'Informes' },
 ];
@@ -3735,11 +4248,13 @@ function closeModal() {
 /** Estima el tamaño en bytes de los datos almacenados. */
 function estimateDataBytes() {
   const payload = {
-    categories: state.categories,
-    expenses:   state.expenses,
-    recurring:  state.recurring,
-    income:     state.income,
-    annualGoal: state.annualGoal,
+    categories:       state.categories,
+    expenses:         state.expenses,
+    recurring:        state.recurring,
+    income:           state.income,
+    incomeCategories: state.incomeCategories,
+    recurringIncome:  state.recurringIncome,
+    annualGoal:       state.annualGoal,
   };
   try {
     return new Blob([JSON.stringify(payload)]).size;
@@ -3787,7 +4302,7 @@ function openMonthPicker() {
         if (pickerYear === state.year && m === state.month) btn.classList.add('current');
         // Marcar meses que tienen datos
         const hasExpenses = state.expenses.some(e => isInAccountingMonth(e.date, pickerYear, m, state.payrollDay));
-        const hasIncome   = state.income.some(i => i.id === `${pickerYear}-${String(m).padStart(2, '0')}`);
+        const hasIncome   = state.income.some(i => isInAccountingMonth(i.date, pickerYear, m, state.payrollDay));
         if (hasExpenses || hasIncome) btn.classList.add('has-data');
 
         btn.addEventListener('click', () => {
@@ -3832,7 +4347,8 @@ async function openChangelogModal() {
     body.appendChild(el('div', { class: 'cl-section-title', text: 'Uso de IndexedDB' }));
 
     const totalRecords = state.categories.length + state.expenses.length
-      + state.recurring.length + state.income.length;
+      + state.recurring.length + state.income.length
+      + state.incomeCategories.length + state.recurringIncome.length;
 
     const grid = el('div', { class: 'db-stats-grid' });
     function dbStat(label, value) {
@@ -3841,11 +4357,13 @@ async function openChangelogModal() {
       it.appendChild(el('span', { class: 'db-stat-value', text: value }));
       return it;
     }
-    grid.appendChild(dbStat('Categorías',        state.categories.length));
-    grid.appendChild(dbStat('Gastos puntuales',  state.expenses.length));
-    grid.appendChild(dbStat('Recurrentes',       state.recurring.length));
-    grid.appendChild(dbStat('Meses con ingresos', state.income.length));
-    grid.appendChild(dbStat('Total registros',   totalRecords));
+    grid.appendChild(dbStat('Categorías',          state.categories.length));
+    grid.appendChild(dbStat('Gastos puntuales',    state.expenses.length));
+    grid.appendChild(dbStat('Recurrentes',         state.recurring.length));
+    grid.appendChild(dbStat('Ingresos',            state.income.length));
+    grid.appendChild(dbStat('Cat. de ingreso',     state.incomeCategories.length));
+    grid.appendChild(dbStat('Ingresos recurrentes', state.recurringIncome.length));
+    grid.appendChild(dbStat('Total registros',     totalRecords));
     body.appendChild(grid);
 
     // Meta inicial vacía; se rellena en idle para no bloquear el modal
@@ -4516,6 +5034,98 @@ function openQuickAdd(dateOverride) {
 
     body.appendChild(form);
     // Focus al importe tras la animación de apertura
+    setTimeout(() => amtInput.focus(), 200);
+  });
+}
+
+/** Alta rápida de una línea de ingreso (espejo de openQuickAdd, con categorías
+ *  de ingreso). La fecha por defecto es hoy; admite override desde el calendario. */
+function openIncomeQuickAdd(dateOverride) {
+  const lastCatId = parseInt(localStorage.getItem('lastIncomeCat'), 10) || null;
+
+  openModal('Añadir ingreso', (body) => {
+    const form = el('form', { class: 'quick-add-form' });
+
+    // Importe (grande)
+    const amtWrap = el('div', { class: 'qa-amount-wrap' });
+    const amtInput = el('input', {
+      type: 'text', inputmode: 'decimal',
+      class: 'form-input mono qa-amount-input',
+      placeholder: '0,00', autocomplete: 'off',
+    });
+    amtWrap.appendChild(amtInput);
+    amtWrap.appendChild(el('span', { class: 'qa-amount-currency', text: '€' }));
+    form.appendChild(amtWrap);
+
+    // Descripción opcional
+    form.appendChild(el('label', { class: 'form-label', text: 'Descripción (opcional)' }));
+    const descInput = el('input', {
+      type: 'text', class: 'form-input',
+      placeholder: 'p.ej. Nómina',
+    });
+    form.appendChild(descInput);
+
+    // Fecha (con override si se pasa)
+    form.appendChild(el('label', { class: 'form-label', text: 'Fecha' }));
+    const dateInput = el('input', {
+      type: 'date', class: 'form-input',
+      value: dateOverride || today(),
+    });
+    form.appendChild(dateInput);
+
+    // Categoría de ingreso como grid de botones
+    form.appendChild(el('label', { class: 'form-label', text: 'Fuente' }));
+    const catGrid = el('div', { class: 'qa-cat-grid' });
+    let selectedCatId = lastCatId && state.incomeCategories.some((c) => c.id === lastCatId)
+      ? lastCatId : null;
+    if (state.incomeCategories.length === 0) {
+      catGrid.appendChild(el('div', {
+        class: 'empty-state',
+        text: 'No hay categorías de ingreso. Créalas en Ajustes.',
+      }));
+    }
+    state.incomeCategories.forEach((c) => {
+      const btn = el('button', { type: 'button', class: 'qa-cat-btn', title: c.name });
+      btn.dataset.id = c.id;
+      const ico = el('span', { class: 'qa-cat-ico' });
+      ico.innerHTML = Icons.svg(c.icon, 18);
+      btn.appendChild(ico);
+      btn.appendChild(el('span', { class: 'qa-cat-name', text: c.name }));
+      if (c.id === selectedCatId) btn.classList.add('selected');
+      btn.addEventListener('click', () => {
+        catGrid.querySelectorAll('.qa-cat-btn').forEach((b) => b.classList.remove('selected'));
+        btn.classList.add('selected');
+        selectedCatId = c.id;
+      });
+      catGrid.appendChild(btn);
+    });
+    form.appendChild(catGrid);
+
+    const submitBtn = el('button', { type: 'submit', class: 'btn btn-primary qa-submit', text: 'Guardar' });
+    form.appendChild(submitBtn);
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const cents = eurToCents(amtInput.value);
+      if (cents <= 0) { amtInput.focus(); return; }
+      if (!selectedCatId) {
+        catGrid.classList.add('shake');
+        setTimeout(() => catGrid.classList.remove('shake'), 400);
+        return;
+      }
+      await DB.addIncomeEntry({
+        date: dateInput.value || today(),
+        amountCents: cents,
+        description: descInput.value.trim(),
+        categoryId: selectedCatId,
+        tags: [],
+      });
+      localStorage.setItem('lastIncomeCat', String(selectedCatId));
+      closeModal();
+      await reload();
+    });
+
+    body.appendChild(form);
     setTimeout(() => amtInput.focus(), 200);
   });
 }
